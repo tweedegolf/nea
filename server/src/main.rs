@@ -164,13 +164,16 @@ fn handle_stream(mut stream: &TcpStream) -> std::io::Result<()> {
     buf.resize(n, 0);
 
     let Ok(input) = String::from_utf8(buf) else {
-        todo!("respond with invalid input error");
+        log::warn!("input not utf8");
+        stream.write_all(b"internal server error")?;
+        return Ok(());
     };
 
     let response = match std::panic::catch_unwind(|| unsafe { roc_main(input) }) {
         Err(e) => {
             log::warn!("a request handler hit a panic: {:?}", e);
-            todo!("respond with internal server error");
+            stream.write_all(b"a request handler hit a panic")?;
+            return Ok(());
         }
         Ok(response) => response,
     };
