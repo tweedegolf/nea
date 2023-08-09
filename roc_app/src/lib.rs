@@ -22,6 +22,7 @@ unsafe impl std::alloc::GlobalAlloc for AppAlloc {
 }
 
 #[no_mangle]
+#[allow(improper_ctypes_definitions)]
 pub extern "C-unwind" fn roc_main(input: String) -> String {
     format!("Hello, {input}")
 }

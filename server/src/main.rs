@@ -34,6 +34,7 @@ extern "C-unwind" {
     // Because this is a rust app, we use the `C-unwind` calling convention. That makes it possible
     // for the app to panic, and for the server to catch that panic and recover. `C-unwind` will
     // not be useful with roc applications, but it will still be correct.
+    #[allow(improper_ctypes)]
     fn roc_main(input: String) -> String;
 }
 
