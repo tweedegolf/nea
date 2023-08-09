@@ -6,10 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-shared = { path = "../shared" } 
+shared = { path = "../shared" }
 log = { version = "0.4", default-features = false, features = [] }
 env_logger = "0.10.0"
 
 
 [build-dependencies]
+roc_app = { path = "../roc_app" }
 cc = "1.0"
