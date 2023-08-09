@@ -8,5 +8,4 @@ edition = "2021"
 [dependencies]
 atomic-wait = "1.1.0"
 libc = "0.2.147"
-naked-function = "0.1.5"
 log = { version = "0.4", default-features = false, features = [] }

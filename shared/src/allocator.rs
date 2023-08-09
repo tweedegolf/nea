@@ -40,7 +40,7 @@ impl ServerAlloc {
         let buckets = unsafe { *self.buckets.get() };
         let bucket = &buckets[bucket_index];
 
-        unsafe { try_alloc_help(layout, bucket.start, &bucket.remaining) }
+        try_alloc_help(layout, bucket.start, &bucket.remaining)
     }
 
     pub fn clear_bucket(&self, bucket_index: usize) {
