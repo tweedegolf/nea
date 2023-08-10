@@ -4,4 +4,4 @@ members = [
     "roc_app",
     "server",
 ]
-exclude = [ ]
+resolver = "2"
