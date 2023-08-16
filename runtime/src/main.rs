@@ -21,17 +21,19 @@ fn main() {
     let mut i = 0;
     for stream in listener.incoming() {
         let stream = stream.unwrap();
+        stream.set_nonblocking(true).unwrap();
         let fd = stream.as_raw_fd();
 
         match executor.reserve() {
             Err(()) => {
                 // no space in the queue
                 log::warn!("main: no space in the queue");
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
 
                 Ok(())
             }
             Ok(index) => executor.execute(index, async move {
-                log::info!("new connection {i} (index = {index}, fd = {fd})");
+                log::info!("new connection {i} (index = {}, fd = {fd})", index.index);
 
                 let tcp_stream = reactor.register(index, stream).unwrap();
 
@@ -43,7 +45,8 @@ fn main() {
                     },
                 }
             }),
-        };
+        }
+        .unwrap();
 
         log::info!("main spawned future for connection {i}");
 
@@ -67,6 +70,8 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     tcp_stream.write(response.as_bytes()).await?;
 
     tcp_stream.flush().await?;
+
+    // tcp_stream.shutdown().await?;
 
     log::info!("handled a request");
 

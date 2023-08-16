@@ -4,6 +4,5 @@ members = [
     "roc_app",
     "server",
     "runtime",
-    "siege",
 ]
 resolver = "2"

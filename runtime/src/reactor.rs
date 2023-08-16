@@ -1,9 +1,8 @@
 // https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 
 use std::{
-    cell::UnsafeCell,
+    cell::RefCell,
     io::Write,
-    mem::MaybeUninit,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex, OnceLock,
@@ -12,6 +11,8 @@ use std::{
 };
 
 use mio::{Events, Interest, Token};
+
+use crate::Index;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -41,7 +42,7 @@ impl Reactor {
 
                 let shared = Shared {
                     registry: poll.registry().try_clone()?,
-                    sources: std::iter::repeat_with(|| UnsafeCell::new(MaybeUninit::new(None)))
+                    sources: std::iter::repeat_with(|| Mutex::new(None))
                         .take(Self::CAPACITY)
                         .collect(),
                 };
@@ -63,28 +64,35 @@ impl Reactor {
 
     pub fn register(
         &self,
-        index: usize,
+        index: Index,
         tcp_stream: std::net::TcpStream,
     ) -> std::io::Result<TcpStream> {
-        tcp_stream.set_nonblocking(true)?;
+        // TODO this line caused some invalid file descriptor error
+        // tcp_stream.set_nonblocking(true).unwrap();
 
         let mut tcp_stream = mio::net::TcpStream::from_std(tcp_stream);
-        let token = Token(index);
+        let token = Token(index.to_usize());
 
         let source = Source {
             interest: Default::default(),
             triggered: Default::default(),
         };
 
-        let target = self.shared.sources[token.0].get();
-        unsafe { std::ptr::write(target, MaybeUninit::new(Some(source))) };
+        let old = self.shared.sources[index.index as usize]
+            .lock()
+            .unwrap()
+            .replace(source);
+        debug_assert!(old.is_none());
 
         // IMPORTANT: only register when everything is in place to handle events on this fd
-        self.shared.registry.register(
-            &mut tcp_stream,
-            token,
-            Interest::READABLE | Interest::WRITABLE,
-        )?;
+        self.shared
+            .registry
+            .register(
+                &mut tcp_stream,
+                token,
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .unwrap();
 
         let tcp_stream = TcpStream {
             tcp_stream,
@@ -107,7 +115,7 @@ impl Reactor {
 
         // update the waker if required
         {
-            let mut interest = source.interest.lock().unwrap();
+            let mut interest = source.interest.lock().expect("poll_ready to take the lock");
 
             match &mut interest[direction as usize] {
                 Some(existing) if existing.will_wake(cx.waker()) => {
@@ -135,7 +143,7 @@ impl Reactor {
 
 struct Shared {
     registry: mio::Registry,
-    sources: Vec<UnsafeCell<MaybeUninit<Option<Source>>>>,
+    sources: Vec<Mutex<Option<Source>>>,
 }
 
 unsafe impl Sync for Shared {}
@@ -172,12 +180,16 @@ impl Shared {
         }
 
         for event in events.iter() {
-            let source = unsafe { (&*self.sources[event.token().0].get()).assume_init_ref() };
+            let task_index = Index::from_usize(event.token().0);
+            let index = task_index.index as usize;
+            let source = self.sources[index].lock().unwrap();
 
-            let mut interest = match source.as_ref() {
-                None => panic!("source id {} is None", event.token().0),
-                Some(source) => source.interest.lock().unwrap(),
+            let source = match source.as_ref() {
+                None => continue,
+                Some(source) => source,
             };
+
+            let mut interest = source.interest.lock().expect("event loop");
 
             if event.is_readable() {
                 if let Some(waker) = interest[Direction::Read as usize].take() {
@@ -185,8 +197,7 @@ impl Shared {
                 }
 
                 // TODO why release?
-                source.as_ref().unwrap().triggered[Direction::Read as usize]
-                    .store(true, Ordering::Release);
+                source.triggered[Direction::Read as usize].store(true, Ordering::Release);
             }
 
             if event.is_writable() {
@@ -195,8 +206,7 @@ impl Shared {
                 }
 
                 // TODO why release?
-                source.as_ref().unwrap().triggered[Direction::Write as usize]
-                    .store(true, Ordering::Release);
+                source.triggered[Direction::Write as usize].store(true, Ordering::Release);
             }
         }
 
@@ -222,16 +232,24 @@ impl TcpStream {
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<T>> {
         loop {
-            let source =
-                unsafe { (&*self.reactor.shared.sources[self.token.0].get()).assume_init_ref() }
-                    .as_ref()
-                    .unwrap();
+            let index = Index::from_usize(self.token.0);
+
+            let source_guard = self.reactor.shared.sources[index.index as usize]
+                .lock()
+                .unwrap();
+            let source = match source_guard.as_ref() {
+                None => {
+                    log::warn!("this source got terminated");
+                    return Poll::Pending;
+                }
+                Some(source) => source,
+            };
 
             std::task::ready!(self.reactor.poll_ready(&source, direction, cx))?;
 
             match f() {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.reactor.clear_trigger(&source, direction);
+                    self.reactor.clear_trigger(source, direction);
                 }
                 val => {
                     return Poll::Ready(val);
@@ -260,11 +278,23 @@ impl TcpStream {
         std::future::poll_fn(|cx| self.poll_io(Direction::Write, || (&self.tcp_stream).flush(), cx))
             .await
     }
+
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| {
+            self.poll_io(
+                Direction::Write,
+                || self.tcp_stream.shutdown(std::net::Shutdown::Both),
+                cx,
+            )
+        })
+        .await
+    }
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        log::info!("token {} removed from poll", self.token.0);
+        let index = Index::from_usize(self.token.0).index as usize;
+        log::info!("token {} removed from poll", index);
 
         let _ = self
             .reactor
@@ -272,8 +302,6 @@ impl Drop for TcpStream {
             .registry
             .deregister(&mut self.tcp_stream);
 
-        let mut value = MaybeUninit::new(None);
-        let source = self.reactor.shared.sources[self.token.0].get();
-        unsafe { std::ptr::swap(source, &mut value) };
+        let _ = self.reactor.shared.sources[index].lock().unwrap().take();
     }
 }
