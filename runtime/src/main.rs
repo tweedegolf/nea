@@ -18,21 +18,18 @@ fn main() {
     println!("listening on 127.0.0.1:8080");
 
     // accept connections and process them serially
-    let mut i = 0;
-    for stream in listener.incoming() {
+    for (i, stream) in listener.incoming().enumerate() {
         let stream = stream.unwrap();
         stream.set_nonblocking(true).unwrap();
         let fd = stream.as_raw_fd();
 
-        match executor.reserve() {
-            Err(()) => {
+        match executor.try_claim() {
+            None => {
                 // no space in the queue
                 log::warn!("main: no space in the queue");
                 stream.shutdown(std::net::Shutdown::Both).unwrap();
-
-                Ok(())
             }
-            Ok(index) => executor.execute(index, async move {
+            Some(index) => executor.execute(index, async move {
                 log::info!("new connection {i} (index = {}, fd = {fd})", index.index);
 
                 let tcp_stream = reactor.register(index, stream).unwrap();
@@ -45,12 +42,9 @@ fn main() {
                     },
                 }
             }),
-        }
-        .unwrap();
+        };
 
         log::info!("main spawned future for connection {i}");
-
-        i += 1;
     }
 }
 

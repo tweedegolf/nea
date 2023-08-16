@@ -37,7 +37,7 @@ fn wake(ptr: *const ()) {
     // NOTE: the unit here is a lie! we just don't know the correct type for the future here
     let executor = Executor::<()>::get().unwrap();
 
-    if let Err(_) = executor.inner.queue.enqueue(index) {
+    if executor.inner.queue.enqueue(index).is_err() {
         log::warn!("task cannot be woken because the queue is full! ");
     }
 }
@@ -92,7 +92,6 @@ where
                     .collect();
                 let filled = Mutex::new(std::iter::repeat(false).take(QUEUE_CAPACITY).collect());
 
-                // let queue = shared::queue::LockFreeQueue::new();
                 let queue = SimpleQueue::with_capacity(QUEUE_CAPACITY);
 
                 let inner = Inner {
@@ -128,11 +127,11 @@ where
             .spawn(|| inner.run())
     }
 
-    pub fn reserve(&self) -> Result<Index, ()> {
-        self.inner.reserve().ok_or(())
+    pub fn try_claim(&self) -> Option<Index> {
+        self.inner.try_claim()
     }
 
-    pub fn execute(&self, index: Index, fut: F) -> Result<(), ()> {
+    pub fn execute(&self, index: Index, fut: F) {
         let task = Task {
             fut,
             identifier: index.identifier,
@@ -140,9 +139,10 @@ where
 
         self.inner.set(index, task);
 
-        self.inner.queue.enqueue(index).unwrap();
-
-        Ok(())
+        match self.inner.queue.enqueue(index) {
+            Ok(()) => (),
+            Err(_) => unreachable!("we claimed a spot!"),
+        }
     }
 }
 
@@ -221,7 +221,7 @@ where
         }
     }
 
-    fn reserve(&self) -> Option<Index> {
+    fn try_claim(&self) -> Option<Index> {
         let mut guard = self.filled.lock().unwrap();
         let index = guard.iter().position(|filled| !filled)?;
 
@@ -252,7 +252,6 @@ where
                 }
                 None => {
                     log::info!("could not claim {}", index.index as usize);
-                    std::thread::sleep_ms(200);
                 }
             }
         }

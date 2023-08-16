@@ -1,7 +1,6 @@
 // https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 
 use std::{
-    cell::RefCell,
     io::Write,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -96,7 +95,7 @@ impl Reactor {
 
         let tcp_stream = TcpStream {
             tcp_stream,
-            reactor: self.clone(),
+            reactor: *self,
             token,
         };
 
@@ -174,7 +173,7 @@ impl Shared {
                 return Err(err);
             }
 
-            panic!("this should not happen?");
+            log::warn!("mio poll hit an error {:?}", err);
 
             return Ok(());
         }
@@ -245,7 +244,7 @@ impl TcpStream {
                 Some(source) => source,
             };
 
-            std::task::ready!(self.reactor.poll_ready(&source, direction, cx))?;
+            std::task::ready!(self.reactor.poll_ready(source, direction, cx))?;
 
             match f() {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
