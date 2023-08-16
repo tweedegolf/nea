@@ -1,14 +1,14 @@
 // https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 
 use std::{
-    collections::HashMap,
-    net::Shutdown,
-    pin::Pin,
+    cell::UnsafeCell,
+    io::Write,
+    mem::MaybeUninit,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
     },
-    task::{ready, Context, Poll, Waker},
+    task::{Context, Poll, Waker},
 };
 
 use mio::{Events, Interest, Token};
@@ -22,7 +22,6 @@ pub enum Direction {
 struct Source {
     interest: Mutex<[Option<Waker>; 2]>,
     triggered: [AtomicBool; 2],
-    token: Token,
 }
 
 #[derive(Clone, Copy)]
@@ -42,8 +41,9 @@ impl Reactor {
 
                 let shared = Shared {
                     registry: poll.registry().try_clone()?,
-                    token: AtomicUsize::new(0),
-                    sources: Mutex::new(HashMap::with_capacity(Self::CAPACITY)),
+                    sources: std::iter::repeat_with(|| UnsafeCell::new(MaybeUninit::new(None)))
+                        .take(Self::CAPACITY)
+                        .collect(),
                 };
 
                 let shared = SHARED.get_or_init(|| shared);
@@ -61,33 +61,34 @@ impl Reactor {
         }
     }
 
-    pub fn register(&self, tcp_stream: std::net::TcpStream) -> std::io::Result<TcpStream> {
+    pub fn register(
+        &self,
+        index: usize,
+        tcp_stream: std::net::TcpStream,
+    ) -> std::io::Result<TcpStream> {
         tcp_stream.set_nonblocking(true)?;
 
         let mut tcp_stream = mio::net::TcpStream::from_std(tcp_stream);
-        let token = Token(self.shared.token.fetch_add(1, Ordering::Relaxed));
+        let token = Token(index);
 
+        let source = Source {
+            interest: Default::default(),
+            triggered: Default::default(),
+        };
+
+        let target = self.shared.sources[token.0].get();
+        unsafe { std::ptr::write(target, MaybeUninit::new(Some(source))) };
+
+        // IMPORTANT: only register when everything is in place to handle events on this fd
         self.shared.registry.register(
             &mut tcp_stream,
             token,
             Interest::READABLE | Interest::WRITABLE,
         )?;
 
-        let source = Arc::new(Source {
-            interest: Default::default(),
-            triggered: Default::default(),
-            token,
-        });
-
-        {
-            let mut sources = self.shared.sources.lock().unwrap();
-            sources.insert(token, source.clone());
-        }
-
         let tcp_stream = TcpStream {
             tcp_stream,
             reactor: self.clone(),
-            _source: source,
             token,
         };
 
@@ -134,9 +135,10 @@ impl Reactor {
 
 struct Shared {
     registry: mio::Registry,
-    token: AtomicUsize,
-    sources: Mutex<HashMap<Token, Arc<Source>>>,
+    sources: Vec<UnsafeCell<MaybeUninit<Option<Source>>>>,
 }
+
+unsafe impl Sync for Shared {}
 
 impl Shared {
     fn run(&self, mut poll: mio::Poll) -> std::io::Result<()> {
@@ -164,20 +166,18 @@ impl Shared {
                 return Err(err);
             }
 
+            panic!("this should not happen?");
+
             return Ok(());
         }
 
         for event in events.iter() {
-            let source = {
-                let sources = self.sources.lock().unwrap();
+            let source = unsafe { (&*self.sources[event.token().0].get()).assume_init_ref() };
 
-                match sources.get(&event.token()) {
-                    Some(source) => source.clone(),
-                    None => continue,
-                }
+            let mut interest = match source.as_ref() {
+                None => panic!("source id {} is None", event.token().0),
+                Some(source) => source.interest.lock().unwrap(),
             };
-
-            let mut interest = source.interest.lock().unwrap();
 
             if event.is_readable() {
                 if let Some(waker) = interest[Direction::Read as usize].take() {
@@ -185,16 +185,18 @@ impl Shared {
                 }
 
                 // TODO why release?
-                source.triggered[Direction::Read as usize].store(true, Ordering::Release);
+                source.as_ref().unwrap().triggered[Direction::Read as usize]
+                    .store(true, Ordering::Release);
             }
 
-            if event.is_readable() {
+            if event.is_writable() {
                 if let Some(waker) = interest[Direction::Write as usize].take() {
                     wakers.push(waker);
                 }
 
                 // TODO why release?
-                source.triggered[Direction::Write as usize].store(true, Ordering::Release);
+                source.as_ref().unwrap().triggered[Direction::Write as usize]
+                    .store(true, Ordering::Release);
             }
         }
 
@@ -209,7 +211,6 @@ impl Shared {
 pub struct TcpStream {
     tcp_stream: mio::net::TcpStream,
     reactor: Reactor,
-    _source: Arc<Source>,
     token: Token,
 }
 
@@ -220,23 +221,19 @@ impl TcpStream {
         mut f: impl FnMut() -> std::io::Result<T>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<T>> {
-        log::trace!("----------> poll io");
         loop {
-            let sources = self.reactor.shared.sources.lock().unwrap();
-            let source = &sources[&self.token];
-            // ready!(self.reactor.poll_ready(&source, direction, cx))?;
-            match self.reactor.poll_ready(&source, direction, cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(_) => {}
-            }
+            let source =
+                unsafe { (&*self.reactor.shared.sources[self.token.0].get()).assume_init_ref() }
+                    .as_ref()
+                    .unwrap();
+
+            std::task::ready!(self.reactor.poll_ready(&source, direction, cx))?;
 
             match f() {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     self.reactor.clear_trigger(&source, direction);
                 }
                 val => {
-                    log::trace!("<---------- poll io");
-
                     return Poll::Ready(val);
                 }
             }
@@ -244,106 +241,39 @@ impl TcpStream {
     }
 
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        TcpStreamRead {
-            tcp_stream: self,
-            buf,
-        }
+        use std::io::Read;
+
+        std::future::poll_fn(|cx| {
+            self.poll_io(Direction::Write, || (&self.tcp_stream).read(buf), cx)
+        })
         .await
     }
 
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        TcpStreamWrite {
-            tcp_stream: self,
-            buf,
-        }
-        .await
-    }
-
-    pub async fn shutdown(&self) -> std::io::Result<()> {
         std::future::poll_fn(|cx| {
-            self.poll_io(
-                Direction::Read,
-                || self.tcp_stream.shutdown(Shutdown::Read),
-                cx,
-            )
-        })
-        .await?;
-
-        std::future::poll_fn(|cx| {
-            self.poll_io(
-                Direction::Write,
-                || self.tcp_stream.shutdown(Shutdown::Both),
-                cx,
-            )
+            self.poll_io(Direction::Write, || (&self.tcp_stream).write(buf), cx)
         })
         .await
     }
 
-    fn poll_read(
-        self: Pin<&mut &Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        use std::io::Read;
-
-        self.poll_io(Direction::Read, || (&self.tcp_stream).read(buf), cx)
-    }
-
-    fn poll_write(
-        self: Pin<&mut &Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        use std::io::Write;
-
-        self.poll_io(Direction::Write, || (&self.tcp_stream).write(buf), cx)
+    pub async fn flush(&self) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| self.poll_io(Direction::Write, || (&self.tcp_stream).flush(), cx))
+            .await
     }
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut sources = self.reactor.shared.sources.lock().unwrap();
-        let _ = sources.remove(&self.token);
+        log::info!("token {} removed from poll", self.token.0);
+
         let _ = self
             .reactor
             .shared
             .registry
             .deregister(&mut self.tcp_stream);
-    }
-}
 
-struct TcpStreamRead<'a> {
-    tcp_stream: &'a TcpStream,
-    buf: &'a mut [u8],
-}
-
-impl<'a> std::future::Future for TcpStreamRead<'a> {
-    type Output = std::io::Result<usize>;
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let unchecked_mut = unsafe { self.get_unchecked_mut() };
-
-        let buf = &mut unchecked_mut.buf;
-        let tcp_stream = unsafe { Pin::new_unchecked(&mut unchecked_mut.tcp_stream) };
-
-        tcp_stream.poll_read(cx, buf)
-    }
-}
-
-struct TcpStreamWrite<'a> {
-    tcp_stream: &'a TcpStream,
-    buf: &'a [u8],
-}
-
-impl<'a> std::future::Future for TcpStreamWrite<'a> {
-    type Output = std::io::Result<usize>;
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let unchecked_mut = unsafe { self.get_unchecked_mut() };
-
-        let buf = &mut unchecked_mut.buf;
-        let tcp_stream = unsafe { Pin::new_unchecked(&mut unchecked_mut.tcp_stream) };
-
-        tcp_stream.poll_write(cx, buf)
+        let mut value = MaybeUninit::new(None);
+        let source = self.reactor.shared.sources[self.token.0].get();
+        unsafe { std::ptr::swap(source, &mut value) };
     }
 }

@@ -3,20 +3,19 @@ pub mod reactor;
 // https://github.com/Hexilee/async-io-demo/blob/master/src/executor.rs
 //https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 use std::{
+    cell::UnsafeCell,
     future::Future,
+    mem::{ManuallyDrop, MaybeUninit},
+    ops::DerefMut,
     pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex, OnceLock,
-    },
+    sync::{Mutex, OnceLock},
     task::{Context, RawWaker, RawWakerVTable, Waker},
 };
 
-use slab::Slab;
-
 const QUEUE_CAPACITY: usize = 4;
 
-const RAW_WAKER_V_TABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, wake, wake, drop_raw);
+const RAW_WAKER_V_TABLE: RawWakerVTable =
+    RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw);
 
 fn clone_raw(ptr: *const ()) -> RawWaker {
     RawWaker::new(ptr, &RAW_WAKER_V_TABLE)
@@ -24,8 +23,13 @@ fn clone_raw(ptr: *const ()) -> RawWaker {
 
 fn drop_raw(_ptr: *const ()) {}
 
+fn wake_by_ref(_ptr: *const ()) {
+    unreachable!()
+}
+
 fn wake(ptr: *const ()) {
     let index = ptr as usize;
+    log::info!("wake {index}");
 
     let executor = Executor::get();
 
@@ -39,9 +43,13 @@ pub struct Executor {
 }
 
 struct Inner {
-    slab: Mutex<Slab<Task>>,
+    futures: Box<[UnsafeCell<MaybeUninit<Task>>]>,
+    filled: Mutex<Box<[bool]>>,
     queue: shared::queue::LockFreeQueue<usize, QUEUE_CAPACITY>,
 }
+
+unsafe impl std::marker::Send for Inner {}
+unsafe impl std::marker::Sync for Inner {}
 
 struct Task {
     fut: Box<dyn Future<Output = ()> + Send>,
@@ -53,13 +61,16 @@ impl Executor {
 
         match INNER.get() {
             None => {
-                let slab = Slab::with_capacity(QUEUE_CAPACITY);
-                let shared = Mutex::new(slab);
+                let futures = std::iter::repeat_with(|| UnsafeCell::new(MaybeUninit::uninit()))
+                    .take(QUEUE_CAPACITY)
+                    .collect();
+                let filled = Mutex::new(std::iter::repeat(false).take(QUEUE_CAPACITY).collect());
 
                 let queue = shared::queue::LockFreeQueue::new();
 
                 let inner = Inner {
-                    slab: shared,
+                    futures,
+                    filled,
                     queue,
                 };
 
@@ -82,41 +93,34 @@ impl Executor {
             .spawn(|| inner.run())
     }
 
-    pub fn execute<F>(&self, fut: F) -> Result<(), ()>
+    pub fn reserve(&self) -> Result<usize, ()> {
+        self.inner.reserve().ok_or(())
+    }
+
+    pub fn execute<F>(&self, index: usize, fut: F) -> Result<(), ()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut slab = self.inner.slab.lock().unwrap();
         let task = Task { fut: Box::new(fut) };
 
-        if ACTIVE.load(Ordering::Acquire) > QUEUE_CAPACITY {
-            log::info!("queue is full! request is dropped");
+        self.inner.set(index, task);
 
-            Err(())
-        } else {
-            ACTIVE.fetch_add(1, Ordering::Release);
+        self.inner.queue.enqueue(index).unwrap();
 
-            let index = slab.insert(task);
-            if let Err(_) = self.inner.queue.enqueue(index) {
-                log::warn!("queue is full! request is dropped");
-                Err(())
-            } else {
-                Ok(())
-            }
-        }
+        Ok(())
     }
 }
-
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 impl Inner {
     fn run(&self) {
         loop {
             let task_index = self.queue.blocking_dequeue();
 
-            let mut slab = self.slab.lock().unwrap();
-            let task = &mut slab[task_index];
-            let pinned = unsafe { Pin::new_unchecked(task.fut.as_mut()) };
+            // *mut MaybeUninit<Box<dyn Future<Output = ()> + Send>>
+            let x = self.futures[task_index].get();
+            let mut task = unsafe { std::ptr::read(x) };
+
+            let pinned = unsafe { Pin::new_unchecked(task.assume_init_mut().fut.as_mut()) };
 
             let raw_waker = RawWaker::new(task_index as *const (), &RAW_WAKER_V_TABLE);
             let waker = unsafe { Waker::from_raw(raw_waker) };
@@ -125,13 +129,48 @@ impl Inner {
             match pinned.poll(&mut cx) {
                 std::task::Poll::Ready(_) => {
                     // allright, future is done, free up its spot in the slab
-                    slab.remove(task_index);
-                    ACTIVE.fetch_sub(1, Ordering::Release);
+                    log::info!("task {task_index} is done");
+                    self.remove(task_index);
                 }
                 std::task::Poll::Pending => {
                     // keep the future in the slab
                 }
             }
         }
+    }
+
+    fn reserve(&self) -> Option<usize> {
+        let mut guard = self.filled.lock().unwrap();
+        let index = guard.iter().position(|filled| !filled)?;
+
+        guard[index] = true;
+
+        Some(index)
+    }
+
+    fn set(&self, index: usize, value: Task) {
+        let mut value = ManuallyDrop::new(value);
+
+        let source = (&mut value).deref_mut();
+        let target = self.futures[index].get();
+
+        unsafe { std::ptr::swap(source, target.cast::<Task>()) };
+    }
+
+    fn remove(&self, index: usize) {
+        let mut guard = self.filled.lock().unwrap();
+
+        let mut value = MaybeUninit::uninit();
+        let source = self.futures[index].get().cast::<Task>();
+        let target = value.as_mut_ptr();
+
+        unsafe { std::ptr::swap(source, target) };
+
+        drop(unsafe { value.assume_init() });
+
+        let mut set = false;
+        std::mem::swap(&mut guard[index], &mut set);
+
+        assert!(set, "to remove a future it must be present");
     }
 }

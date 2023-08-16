@@ -18,27 +18,41 @@ fn main() {
     println!("listening on 127.0.0.1:8080");
 
     // accept connections and process them serially
+    let mut i = 0;
     for stream in listener.incoming() {
         let stream = stream.unwrap();
         let fd = stream.as_raw_fd();
-        log::trace!("new connection at {}", fd);
 
-        let result = executor.execute(async move {
-            let tcp_stream = reactor.register(stream).unwrap();
+        match executor.reserve() {
+            Err(()) => {
+                // no space in the queue
+                log::warn!("main: no space in the queue");
 
-            match app(tcp_stream).await {
-                Ok(()) => {}
-                Err(e) => match e.kind() {
-                    ErrorKind::NotConnected => {}
-                    _ => Err(e).unwrap(),
-                },
+                Ok(())
             }
-        });
+            Ok(index) => executor.execute(index, async move {
+                log::info!("new connection {i} (index = {index}, fd = {fd})");
+
+                let tcp_stream = reactor.register(index, stream).unwrap();
+
+                match app(tcp_stream).await {
+                    Ok(()) => {}
+                    Err(e) => match dbg!(e.kind()) {
+                        ErrorKind::NotConnected => {}
+                        _ => Err(e).unwrap(),
+                    },
+                }
+            }),
+        };
+
+        log::info!("main spawned future for connection {i}");
+
+        i += 1;
     }
 }
 
 async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
-    let mut buffer = [0; 64];
+    let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
 
     let input = &buffer[..n];
@@ -52,7 +66,7 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
 
     tcp_stream.write(response.as_bytes()).await?;
 
-    tcp_stream.shutdown().await?;
+    tcp_stream.flush().await?;
 
     log::info!("handled a request");
 

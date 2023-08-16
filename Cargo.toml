@@ -3,5 +3,7 @@ members = [
     "shared",
     "roc_app",
     "server",
+    "runtime",
+    "siege",
 ]
 resolver = "2"
