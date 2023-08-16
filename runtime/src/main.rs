@@ -1,6 +1,6 @@
 use std::{
-    io::{ErrorKind, Write},
-    os::fd::{AsRawFd, FromRawFd},
+    io::{Cursor, ErrorKind, Write},
+    os::fd::AsRawFd,
 };
 
 use runtime::reactor;
@@ -8,7 +8,7 @@ use runtime::reactor;
 fn main() {
     env_logger::init();
 
-    let executor = runtime::Executor::get();
+    let executor = runtime::Executor::get_or_init();
     let reactor = runtime::reactor::Reactor::get().unwrap();
 
     let _handle1 = executor.spawn_worker().unwrap();
@@ -61,19 +61,35 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
 
-    let mut response = String::new();
-    response.push_str("HTTP/1.1 200 OK\r\n");
-    response.push_str("Content-Type: text/html\r\n");
-    response.push_str("\r\n");
-    response.push_str(&format!("<html>{input}</html>"));
+    let mut buffer = [0u8; 1024];
+    let mut response = Cursor::new(&mut buffer[..]);
+    let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
+    let _ = response.write_all(b"Content-Type: text/html\r\n");
+    let _ = response.write_all(b"\r\n");
+    let _ = response.write_fmt(format_args!("<html>{input}</html>"));
+    let n = response.position() as usize;
 
-    tcp_stream.write(response.as_bytes()).await?;
+    tcp_stream.write(&response.get_ref()[..n]).await?;
 
     tcp_stream.flush().await?;
-
-    // tcp_stream.shutdown().await?;
 
     log::info!("handled a request");
 
     Ok(())
+}
+
+#[global_allocator]
+static ALLOCATOR: LogSystem = LogSystem(std::alloc::System);
+
+struct LogSystem(std::alloc::System);
+
+unsafe impl std::alloc::GlobalAlloc for LogSystem {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        eprintln!("allocating {} bytes", layout.size());
+        self.0.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        self.0.dealloc(ptr, layout)
+    }
 }

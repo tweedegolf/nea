@@ -34,37 +34,57 @@ fn wake(ptr: *const ()) {
     let index = Index::from_ptr(ptr);
     log::trace!("wake {}", index.index);
 
-    let executor = Executor::get();
+    // NOTE: the unit here is a lie! we just don't know the correct type for the future here
+    let executor = Executor::<()>::get().unwrap();
 
     if let Err(_) = executor.inner.queue.enqueue(index) {
         log::warn!("task cannot be woken because the queue is full! ");
     }
 }
 
-pub struct Executor {
-    inner: &'static Inner,
+pub struct Executor<F: 'static> {
+    inner: &'static Inner<F>,
 }
 
-struct Inner {
-    futures: Box<[Mutex<Option<Task>>]>,
+struct Inner<F> {
+    futures: Box<[Mutex<Option<Task<F>>>]>,
     filled: Mutex<Box<[bool]>>,
     queue: SimpleQueue<Index>,
     identifier: AtomicU32,
 }
 
-unsafe impl std::marker::Send for Inner {}
-unsafe impl std::marker::Sync for Inner {}
+unsafe impl<F: Send> std::marker::Send for Inner<F> {}
+unsafe impl<F: Send> std::marker::Sync for Inner<F> {}
 
 #[repr(C)]
-struct Task {
-    fut: Box<dyn Future<Output = ()> + Send>,
+struct Task<F> {
+    fut: F,
     identifier: u32,
 }
 
-impl Executor {
-    pub fn get() -> Self {
-        static INNER: OnceLock<Inner> = OnceLock::new();
+static INNER: OnceLock<&()> = OnceLock::new();
 
+impl<F> Executor<F> {
+    pub fn get() -> Option<Self> {
+        let inner: &&() = INNER.get()?;
+        let ptr: *const () = *inner;
+        let inner = unsafe { &*(ptr.cast()) };
+        // already initialized
+        Some(Executor { inner })
+    }
+}
+
+impl<F> Executor<F>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    pub fn type_hint<G>(&self, _: G)
+    where
+        G: Fn(reactor::TcpStream) -> F,
+    {
+    }
+
+    pub fn get_or_init() -> Self {
         match INNER.get() {
             None => {
                 let futures = std::iter::repeat_with(|| Mutex::new(None))
@@ -82,12 +102,19 @@ impl Executor {
                     identifier: AtomicU32::new(1),
                 };
 
-                let inner = INNER.get_or_init(move || inner);
+                let boxed = Box::new(inner);
+                let leaked = Box::leak(boxed) as &'static Inner<_>;
+                let ptr_unit =
+                    unsafe { std::mem::transmute::<&'static Inner<_>, &'static ()>(leaked) };
 
-                Executor { inner }
+                let _ = INNER.get_or_init(move || ptr_unit);
+
+                Executor { inner: leaked }
             }
 
             Some(inner) => {
+                let ptr: *const () = *inner;
+                let inner = unsafe { &*(ptr.cast()) };
                 // already initialized
                 Executor { inner }
             }
@@ -105,12 +132,9 @@ impl Executor {
         self.inner.reserve().ok_or(())
     }
 
-    pub fn execute<F>(&self, index: Index, fut: F) -> Result<(), ()>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
+    pub fn execute(&self, index: Index, fut: F) -> Result<(), ()> {
         let task = Task {
-            fut: Box::new(fut),
+            fut,
             identifier: index.identifier,
         };
 
@@ -159,7 +183,10 @@ impl Index {
     }
 }
 
-impl Inner {
+impl<F> Inner<F>
+where
+    F: Future<Output = ()> + Send,
+{
     fn run(&self) {
         loop {
             let task_index = self.queue.blocking_dequeue();
@@ -174,7 +201,7 @@ impl Inner {
                 Some(inner) => inner,
             };
 
-            let pinned = unsafe { Pin::new_unchecked(task.fut.as_mut()) };
+            let pinned = unsafe { Pin::new_unchecked(&mut task.fut) };
 
             let raw_waker = RawWaker::new(task_index.to_ptr(), &RAW_WAKER_V_TABLE);
             let waker = unsafe { Waker::from_raw(raw_waker) };
@@ -206,7 +233,7 @@ impl Inner {
         Some(Index { identifier, index })
     }
 
-    fn set(&self, index: Index, value: Task) {
+    fn set(&self, index: Index, value: Task<F>) {
         let old = self.futures[index.index as usize]
             .try_lock()
             .unwrap()
