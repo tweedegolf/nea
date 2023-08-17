@@ -55,6 +55,8 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
 
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(tcp_stream).await?;
+
     let mut buffer = [0u8; 1024];
     let mut response = Cursor::new(&mut buffer[..]);
     let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
