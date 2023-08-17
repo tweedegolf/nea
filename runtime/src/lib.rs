@@ -7,7 +7,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, Ordering},
         Mutex, OnceLock,
     },
     task::{Context, RawWaker, RawWakerVTable, Waker},

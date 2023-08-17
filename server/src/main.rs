@@ -41,7 +41,7 @@ extern "C-unwind" {
 /// Function called when the applications hits a (from its perspective) unrecoverable error.
 ///
 /// For instance: out of memory, an assert, division by zero
-pub extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! {
+pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! {
     let thread_id = std::thread::current().id();
 
     assert!(!message_ptr.is_null());
@@ -51,7 +51,7 @@ pub extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! {
 
     eprintln!("thread {thread_id:?} hit a panic {panic_tag}: {message}");
 
-    JMP_BUFFER.with(|env| unsafe { crate::longjmp(env.get(), 1) })
+    JMP_BUFFER.with(|env| unsafe { longjmp(env.get(), 1) })
 }
 
 /// Core primitive for the application's allocator.
@@ -210,8 +210,8 @@ fn main() {
             // TODO handle any panics in the workers
         }
 
-        let listener = TcpListener::bind("127.0.0.1:34254").unwrap();
-        println!("listening on 127.0.0.1:34254");
+        let listener = TcpListener::bind("127.0.0.1:8000").unwrap();
+        println!("listening on 127.0.0.1:8000");
 
         for stream in listener.incoming() {
             match queue.enqueue(stream.unwrap()) {
