@@ -1,6 +1,10 @@
 // https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 
+use hyper::rt::ReadBufCursor;
+use std::io::Error;
+use std::mem::MaybeUninit;
 use std::ops::DerefMut;
+use std::pin::Pin;
 use std::{
     io::Write,
     sync::{
@@ -265,6 +269,52 @@ impl TcpStream {
             self.poll_io(|| self.tcp_stream.shutdown(std::net::Shutdown::Both), cx)
         })
         .await
+    }
+}
+
+impl hyper::rt::Read for TcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        const TMP_BUF_LEN: usize = 1024;
+        use std::io::Read;
+
+        let buf_mut = unsafe { buf.as_mut() };
+        let mut tmp_buf = [0; TMP_BUF_LEN];
+        let remaining = buf_mut.len().min(TMP_BUF_LEN);
+
+        let poll = self.poll_io(|| (&self.tcp_stream).read(&mut tmp_buf[..remaining]), cx);
+
+        let n = std::task::ready!(poll)?;
+        let tmp_buf = tmp_buf.map(MaybeUninit::new);
+
+        buf_mut[..n].copy_from_slice(&tmp_buf[..n]);
+
+        unsafe {
+            buf.advance(n);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl hyper::rt::Write for TcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        self.poll_io(|| (&self.tcp_stream).write(buf), cx)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.poll_io(|| (&self.tcp_stream).flush(), cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.poll_io(|| self.tcp_stream.shutdown(std::net::Shutdown::Both), cx)
     }
 }
 
