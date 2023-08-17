@@ -24,7 +24,7 @@ def send_tcp_request(host, port, message):
 
 if __name__ == "__main__":
     host = "localhost"  # Change this to the server's IP address if not running locally
-    port = 34254
+    port = 8000
     message = "xyz"
 
     try:
