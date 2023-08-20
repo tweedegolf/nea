@@ -7,13 +7,13 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
     task::{Context, RawWaker, RawWakerVTable, Waker},
 };
 
-const QUEUE_CAPACITY: usize = 8;
+const QUEUE_CAPACITY: usize = 64;
 
 const RAW_WAKER_V_TABLE: RawWakerVTable =
     RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw);
@@ -50,6 +50,7 @@ struct Inner<F> {
     futures: Box<[Mutex<Option<Task<F>>>]>,
     filled: Mutex<Box<[bool]>>,
     queue: SimpleQueue<Index>,
+    // queue: ComplexQueue,
     identifier: AtomicU32,
 }
 
@@ -93,6 +94,7 @@ where
                 let filled = Mutex::new(std::iter::repeat(false).take(QUEUE_CAPACITY).collect());
 
                 let queue = SimpleQueue::with_capacity(QUEUE_CAPACITY);
+                // let queue = ComplexQueue::with_capacity(QUEUE_CAPACITY);
 
                 let inner = Inner {
                     futures,
@@ -190,7 +192,6 @@ where
     fn run(&self) {
         loop {
             let task_index = self.queue.blocking_dequeue();
-            log::info!("dequeue'd {}", task_index.index);
 
             // *mut MaybeUninit<Box<dyn Future<Output = ()> + Send>>
             let mut task_mut = self.futures[task_index.index as usize].try_lock().unwrap();
@@ -295,6 +296,122 @@ impl<T: PartialEq> SimpleQueue<T> {
                 Some(value) => return value,
                 None => queue = self.condvar.wait(queue).unwrap(),
             }
+        }
+    }
+}
+
+// bit N is set if element N is in the queue, 0 if it is not
+struct ComplexQueue {
+    // queue bits
+    bits: Box<[AtomicUsize]>,
+    // backing storage
+    backing_storage: Box<[AtomicU32]>,
+    // number of items in the queue
+    available: AtomicU32,
+    // current
+    current: AtomicUsize,
+}
+
+impl ComplexQueue {
+    fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity % 64 == 0);
+
+        Self {
+            bits: std::iter::repeat_with(|| AtomicUsize::new(0))
+                .take(capacity / 64)
+                .collect(),
+            backing_storage: std::iter::repeat_with(|| AtomicU32::new(0))
+                .take(capacity)
+                .collect(),
+            available: AtomicU32::new(0),
+            current: AtomicUsize::new(0),
+        }
+    }
+
+    fn enqueue(&self, index: Index) -> Result<(), Index> {
+        match self.enqueue_help(index.index as usize, index) {
+            true => Ok(()),
+            false => Err(index),
+        }
+    }
+
+    fn enqueue_help(&self, index: usize, item: Index) -> bool {
+        let bucket = index / 64;
+        let mask = 1 << (63 - (index % 64));
+
+        let old = self.bits[bucket].fetch_or(mask, Ordering::AcqRel);
+
+        let added = old & mask == 0;
+        debug_assert!(added, "this is a race condition",);
+
+        self.backing_storage[bucket].store(item.identifier, Ordering::Relaxed);
+        self.available.fetch_add(added as u32, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+
+        atomic_wait::wake_one(&self.available);
+
+        added
+    }
+
+    fn blocking_dequeue(&self) -> Index {
+        let length = self.bits.len();
+
+        'outer: loop {
+            // wait until the available count is not zero
+            while self.available.load(Ordering::Acquire) == 0 {
+                atomic_wait::wait(&self.available, 0);
+            }
+
+            let start = self.current.load(Ordering::Acquire) as usize;
+            let bucket_index = start % length;
+
+            // SAFETY: bucket is mod length
+            let bucket_atomic = unsafe { self.bits.get_unchecked(bucket_index) };
+
+            let bits = bucket_atomic.load(Ordering::Acquire);
+
+            if bits == 0 {
+                match self.current.compare_exchange(
+                    bucket_index,
+                    (bucket_index + 1) % length,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        // we updated the current bucket
+                        // for simplicity, just start from the top
+                        continue 'outer;
+                    }
+                    Err(_) => {
+                        // another thread already updated current.
+                        // for simplicity, just start from the top
+                        continue 'outer;
+                    }
+                }
+            }
+
+            let offset = bits.leading_zeros() as usize;
+            let mask = 1 << (63 - offset);
+
+            // set the target index bit to 0
+            let identifier = self.backing_storage[bucket_index].load(Ordering::Relaxed);
+            let old = bucket_atomic.fetch_and(!mask, Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::AcqRel);
+
+            if old & mask == 0 {
+                // someone else got to this bit before us
+                // for simplicity, just start from the top
+                continue 'outer;
+            }
+
+            self.available.fetch_sub(1, Ordering::Release);
+
+            let index = Index {
+                identifier,
+                index: (bucket_index * 64 + offset) as u32,
+            };
+
+            return index;
         }
     }
 }

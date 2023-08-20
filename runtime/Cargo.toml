@@ -12,3 +12,4 @@ mio = { version = "0.8.8", features = ["os-poll", "net"] }
 slab = "0.4.8"
 
 shared = { path = "../shared/" }
+atomic-wait = "1.1.0"
