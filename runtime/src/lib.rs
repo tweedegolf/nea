@@ -7,13 +7,13 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
     task::{Context, RawWaker, RawWakerVTable, Waker},
 };
 
-const QUEUE_CAPACITY: usize = 8;
+const QUEUE_CAPACITY: usize = 64;
 
 const RAW_WAKER_V_TABLE: RawWakerVTable =
     RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw);
@@ -190,10 +190,8 @@ where
     fn run(&self) {
         loop {
             let task_index = self.queue.blocking_dequeue();
-            log::info!("dequeue'd {}", task_index.index);
 
-            // *mut MaybeUninit<Box<dyn Future<Output = ()> + Send>>
-            let mut task_mut = self.futures[task_index.index as usize].try_lock().unwrap();
+            let mut task_mut = self.futures[task_index.index as usize].lock().unwrap();
 
             let task = match task_mut.as_mut() {
                 None => continue,
