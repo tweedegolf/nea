@@ -13,3 +13,4 @@ slab = "0.4.8"
 
 shared = { path = "../shared/" }
 atomic-wait = "1.1.0"
+reqwest = "0.11.19"
