@@ -1,9 +1,10 @@
+use hyper::Request;
 use std::{
     io::{Cursor, ErrorKind, Write},
     os::fd::AsRawFd,
 };
 
-use runtime::reactor;
+use runtime::{reactor, Index};
 
 fn main() {
     env_logger::init();
@@ -48,6 +49,30 @@ fn main() {
     }
 }
 
+// async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
+//     let mut buffer = [0; 1024];
+//     let n = tcp_stream.read(&mut buffer).await?;
+//
+//     let input = &buffer[..n];
+//     let input = std::str::from_utf8(input).unwrap();
+//
+//     let mut buffer = [0u8; 1024];
+//     let mut response = Cursor::new(&mut buffer[..]);
+//     let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
+//     let _ = response.write_all(b"Content-Type: text/html\r\n");
+//     let _ = response.write_all(b"\r\n");
+//     let _ = response.write_fmt(format_args!("<html>{input}</html>"));
+//     let n = response.position() as usize;
+//
+//     tcp_stream.write(&response.get_ref()[..n]).await?;
+//
+//     tcp_stream.flush().await?;
+//
+//     log::info!("handled a request");
+//
+//     Ok(())
+// }
+
 async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
@@ -55,7 +80,29 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
 
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(tcp_stream).await?;
+    let url = "http://httpbin.org/ip".parse::<hyper::Uri>().unwrap();
+    let host = url.host().expect("uri has no host");
+    let port = url.port_u16().unwrap_or(80);
+
+    let stream = std::net::TcpStream::connect(format!("{}:{}", host, port)).unwrap();
+    let reactor = reactor::Reactor::get().unwrap();
+    let index = Index {
+        identifier: 1,
+        index: 2,
+    };
+    let stream = reactor.register(index, stream).unwrap();
+
+    let (mut sender, _conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+
+    let authority = url.authority().unwrap().clone();
+
+    let req = Request::builder()
+        .uri(url)
+        .header(hyper::header::HOST, authority.as_str())
+        .body(String::new())
+        .unwrap();
+
+    let mut res = sender.send_request(req).await.unwrap();
 
     let mut buffer = [0u8; 1024];
     let mut response = Cursor::new(&mut buffer[..]);

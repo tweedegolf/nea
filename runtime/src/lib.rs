@@ -149,7 +149,7 @@ where
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Index {
-    identifier: u32,
+    pub identifier: u32,
     pub index: u32,
 }
 
