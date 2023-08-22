@@ -1,5 +1,6 @@
 // https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 
+use std::ops::DerefMut;
 use std::{
     io::Write,
     sync::{
@@ -13,15 +14,9 @@ use mio::{Events, Interest, Token};
 
 use crate::Index;
 
-#[derive(Debug, Clone, Copy)]
-pub enum Direction {
-    Read = 0,
-    Write = 1,
-}
-
 struct Source {
-    interest: Mutex<[Option<Waker>; 2]>,
-    triggered: [AtomicBool; 2],
+    interest: Mutex<Option<Waker>>,
+    triggered: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -102,13 +97,8 @@ impl Reactor {
         Ok(tcp_stream)
     }
 
-    fn poll_ready(
-        &self,
-        source: &Source,
-        direction: Direction,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if source.triggered[direction as usize].load(Ordering::Acquire) {
+    fn poll_ready(&self, source: &Source, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if source.triggered.load(Ordering::Acquire) {
             return Poll::Ready(Ok(()));
         }
 
@@ -116,7 +106,7 @@ impl Reactor {
         {
             let mut interest = source.interest.lock().expect("poll_ready to take the lock");
 
-            match &mut interest[direction as usize] {
+            match interest.deref_mut() {
                 Some(existing) if existing.will_wake(cx.waker()) => {
                     /* has the right waker already */
                 }
@@ -127,7 +117,7 @@ impl Reactor {
         }
 
         // check if anything changed while we were registering our waker
-        if source.triggered[direction as usize].load(Ordering::Acquire) {
+        if source.triggered.load(Ordering::Acquire) {
             // just wake up immediately
             return Poll::Ready(Ok(()));
         }
@@ -135,8 +125,8 @@ impl Reactor {
         Poll::Pending
     }
 
-    fn clear_trigger(&self, source: &Source, direction: Direction) {
-        source.triggered[direction as usize].store(false, Ordering::Release);
+    fn clear_trigger(&self, source: &Source) {
+        source.triggered.store(false, Ordering::Release);
     }
 }
 
@@ -191,21 +181,21 @@ impl Shared {
             let mut interest = source.interest.lock().expect("event loop");
 
             if event.is_readable() {
-                if let Some(waker) = interest[Direction::Read as usize].take() {
+                if let Some(waker) = interest.take() {
                     wakers.push(waker);
                 }
 
                 // TODO why release?
-                source.triggered[Direction::Read as usize].store(true, Ordering::Release);
+                source.triggered.store(true, Ordering::Release);
             }
 
             if event.is_writable() {
-                if let Some(waker) = interest[Direction::Write as usize].take() {
+                if let Some(waker) = interest.take() {
                     wakers.push(waker);
                 }
 
                 // TODO why release?
-                source.triggered[Direction::Write as usize].store(true, Ordering::Release);
+                source.triggered.store(true, Ordering::Release);
             }
         }
 
@@ -226,7 +216,6 @@ pub struct TcpStream {
 impl TcpStream {
     pub fn poll_io<T>(
         &self,
-        direction: Direction,
         mut f: impl FnMut() -> std::io::Result<T>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<T>> {
@@ -244,11 +233,11 @@ impl TcpStream {
                 Some(source) => source,
             };
 
-            std::task::ready!(self.reactor.poll_ready(source, direction, cx))?;
+            std::task::ready!(self.reactor.poll_ready(source, cx))?;
 
             match f() {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.reactor.clear_trigger(source, direction);
+                    self.reactor.clear_trigger(source);
                 }
                 val => {
                     return Poll::Ready(val);
@@ -260,31 +249,20 @@ impl TcpStream {
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         use std::io::Read;
 
-        std::future::poll_fn(|cx| {
-            self.poll_io(Direction::Write, || (&self.tcp_stream).read(buf), cx)
-        })
-        .await
+        std::future::poll_fn(|cx| self.poll_io(|| (&self.tcp_stream).read(buf), cx)).await
     }
 
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        std::future::poll_fn(|cx| {
-            self.poll_io(Direction::Write, || (&self.tcp_stream).write(buf), cx)
-        })
-        .await
+        std::future::poll_fn(|cx| self.poll_io(|| (&self.tcp_stream).write(buf), cx)).await
     }
 
     pub async fn flush(&self) -> std::io::Result<()> {
-        std::future::poll_fn(|cx| self.poll_io(Direction::Write, || (&self.tcp_stream).flush(), cx))
-            .await
+        std::future::poll_fn(|cx| self.poll_io(|| (&self.tcp_stream).flush(), cx)).await
     }
 
     pub async fn shutdown(&self) -> std::io::Result<()> {
         std::future::poll_fn(|cx| {
-            self.poll_io(
-                Direction::Write,
-                || self.tcp_stream.shutdown(std::net::Shutdown::Both),
-                cx,
-            )
+            self.poll_io(|| self.tcp_stream.shutdown(std::net::Shutdown::Both), cx)
         })
         .await
     }
