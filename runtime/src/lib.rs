@@ -5,51 +5,88 @@ pub mod reactor;
 use std::{
     collections::VecDeque,
     future::Future,
+    ops::DerefMut,
     pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     task::{Context, RawWaker, RawWakerVTable, Waker},
 };
 
 const QUEUE_CAPACITY: usize = 64;
 
-const RAW_WAKER_V_TABLE: RawWakerVTable =
-    RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw);
-
-fn clone_raw(ptr: *const ()) -> RawWaker {
-    RawWaker::new(ptr, &RAW_WAKER_V_TABLE)
-}
-
-fn drop_raw(_ptr: *const ()) {
-    /* no-op */
-}
-
-fn wake_by_ref(_ptr: *const ()) {
-    unreachable!()
-}
-
-fn wake(ptr: *const ()) {
-    let index = Index::from_ptr(ptr);
-    log::trace!("wake {}", index.index);
-
-    // NOTE: the unit here is a lie! we just don't know the correct type for the future here
-    let executor = Executor::<()>::get().unwrap();
-
-    if executor.inner.queue.enqueue(index).is_err() {
-        log::warn!("task cannot be woken because the queue is full! ");
+const RAW_WAKER_V_TABLE: RawWakerVTable = {
+    fn clone_raw(ptr: *const ()) -> RawWaker {
+        RawWaker::new(ptr, &RAW_WAKER_V_TABLE)
     }
-}
+
+    fn drop_raw(_ptr: *const ()) {
+        /* no-op */
+    }
+
+    fn wake_by_ref(ptr: *const ()) {
+        wake(ptr)
+    }
+
+    fn wake(ptr: *const ()) {
+        let index = Index::from_ptr(ptr);
+        log::trace!("wake {}", index.index);
+
+        // NOTE: the unit here is a lie! we just don't know the correct type for the future here
+        let executor = Executor::<()>::get().unwrap();
+
+        if executor.inner.queue.enqueue(Job::Index(index)).is_err() {
+            log::warn!("task cannot be woken because the queue is full! ");
+        }
+    }
+
+    RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw)
+};
 
 pub struct Executor<F: 'static> {
     inner: &'static Inner<F>,
 }
 
+struct Connection {
+    connection: Mutex<hyper::client::conn::http1::Connection<reactor::TcpStream, String>>,
+    identifier: u32,
+}
+
+impl std::task::Wake for Connection {
+    fn wake(self: Arc<Self>) {
+        log::trace!("wake {}", self.identifier);
+
+        let job = Job::Connection(self);
+
+        // NOTE: the unit here is a lie! we just don't know the correct type for the future here
+        let executor = Executor::<()>::get().unwrap();
+
+        if executor.inner.queue.enqueue(job).is_err() {
+            log::warn!("task cannot be woken because the queue is full! ");
+        }
+    }
+}
+
+enum Job {
+    Index(Index),
+    Connection(Arc<Connection>),
+}
+
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Index(l0), Self::Index(r0)) => l0 == r0,
+            (Self::Connection(l0), Self::Connection(r0)) => l0.identifier == r0.identifier,
+            _ => false,
+        }
+    }
+}
+
 struct Inner<F> {
     futures: Box<[Mutex<Option<Task<F>>>]>,
     filled: Mutex<Box<[bool]>>,
-    queue: SimpleQueue<Index>,
+    queue: SimpleQueue<Job>,
     identifier: AtomicU32,
 }
 
@@ -71,6 +108,39 @@ impl<F> Executor<F> {
         let inner = unsafe { &*(ptr.cast()) };
         // already initialized
         Some(Executor { inner })
+    }
+
+    pub async fn handshake(
+        &self,
+        index: Index,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<hyper::client::conn::http1::SendRequest<String>> {
+        let stream = std::net::TcpStream::connect(format!("{}:{}", host, port)).unwrap();
+        stream.set_nonblocking(true)?;
+
+        let reactor = reactor::Reactor::get().unwrap();
+        let tcp_index = Index {
+            identifier: index.identifier,
+            index: 2,
+        };
+
+        let stream = reactor.register(tcp_index, stream).unwrap();
+
+        let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+
+        let connection = Connection {
+            connection: Mutex::new(conn),
+            identifier: index.identifier,
+        };
+
+        let job = Job::Connection(Arc::new(connection));
+
+        if self.inner.queue.enqueue(job).is_err() {
+            log::warn!("connection cannot be started because the queue is full! ");
+        }
+
+        Ok(sender)
     }
 }
 
@@ -139,7 +209,7 @@ where
 
         self.inner.set(index, task);
 
-        match self.inner.queue.enqueue(index) {
+        match self.inner.queue.enqueue(Job::Index(index)) {
             Ok(()) => (),
             Err(_) => unreachable!("we claimed a spot!"),
         }
@@ -189,31 +259,51 @@ where
 {
     fn run(&self) {
         loop {
-            let task_index = self.queue.blocking_dequeue();
+            let job = self.queue.blocking_dequeue();
 
-            let mut task_mut = self.futures[task_index.index as usize].lock().unwrap();
+            match job {
+                Job::Index(task_index) => {
+                    let mut task_mut = self.futures[task_index.index as usize].lock().unwrap();
 
-            let task = match task_mut.as_mut() {
-                None => continue,
-                Some(task) if task.identifier != task_index.identifier => continue,
-                Some(inner) => inner,
-            };
+                    let task = match task_mut.as_mut() {
+                        None => continue,
+                        Some(task) if task.identifier != task_index.identifier => continue,
+                        Some(inner) => inner,
+                    };
 
-            let pinned = unsafe { Pin::new_unchecked(&mut task.fut) };
+                    let pinned = unsafe { Pin::new_unchecked(&mut task.fut) };
 
-            let raw_waker = RawWaker::new(task_index.to_ptr(), &RAW_WAKER_V_TABLE);
-            let waker = unsafe { Waker::from_raw(raw_waker) };
-            let mut cx = Context::from_waker(&waker);
+                    let raw_waker = RawWaker::new(task_index.to_ptr(), &RAW_WAKER_V_TABLE);
+                    let waker = unsafe { Waker::from_raw(raw_waker) };
+                    let mut cx = Context::from_waker(&waker);
 
-            match pinned.poll(&mut cx) {
-                std::task::Poll::Ready(_) => {
-                    // allright, future is done, free up its spot in the slab
-                    log::info!("task {} is done", task_index.index);
-                    drop(task_mut);
-                    self.remove(task_index);
+                    match pinned.poll(&mut cx) {
+                        std::task::Poll::Ready(_) => {
+                            // allright, future is done, free up its spot in the slab
+                            log::info!("task {} is done", task_index.index);
+                            drop(task_mut);
+                            self.remove(task_index);
+                        }
+                        std::task::Poll::Pending => {
+                            // keep the future in the slab
+                        }
+                    }
                 }
-                std::task::Poll::Pending => {
-                    // keep the future in the slab
+                Job::Connection(task) => {
+                    let waker = std::task::Waker::from(task.clone());
+                    let mut cx = Context::from_waker(&waker);
+
+                    let mut locked = task.connection.lock().unwrap();
+                    let pinned = unsafe { Pin::new_unchecked(locked.deref_mut()) };
+
+                    match pinned.poll(&mut cx) {
+                        std::task::Poll::Ready(_) => {
+                            // drop(task_mut);
+                        }
+                        std::task::Poll::Pending => {
+                            // keep the future in the slab
+                        }
+                    }
                 }
             }
         }

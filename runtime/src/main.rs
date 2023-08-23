@@ -80,19 +80,24 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
 
-    let url = "http://httpbin.org/ip".parse::<hyper::Uri>().unwrap();
+    let index = Index {
+        identifier: 0,
+        index: 0,
+    };
+
+    let url = "http://docs.rs/h2/latest/h2/"
+        .parse::<hyper::Uri>()
+        .unwrap();
     let host = url.host().expect("uri has no host");
     let port = url.port_u16().unwrap_or(80);
 
-    let stream = std::net::TcpStream::connect(format!("{}:{}", host, port)).unwrap();
-    let reactor = reactor::Reactor::get().unwrap();
-    let index = Index {
-        identifier: 1,
-        index: 2,
-    };
-    let stream = reactor.register(index, stream).unwrap();
+    let mut sender = runtime::Executor::<()>::get()
+        .unwrap()
+        .handshake(index, host, port)
+        .await
+        .unwrap();
 
-    let (mut sender, _conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+    log::info!("performed handshake {} {}", index.index, index.identifier);
 
     let authority = url.authority().unwrap().clone();
 
@@ -102,7 +107,9 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
         .body(String::new())
         .unwrap();
 
-    let mut res = sender.send_request(req).await.unwrap();
+    log::info!("built request");
+
+    let res = sender.send_request(req).await.unwrap();
 
     let mut buffer = [0u8; 1024];
     let mut response = Cursor::new(&mut buffer[..]);
