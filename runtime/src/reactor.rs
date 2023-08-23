@@ -74,6 +74,7 @@ impl Reactor {
         // tcp_stream.set_nonblocking(true).unwrap();
 
         let mut tcp_stream = mio::net::TcpStream::from_std(tcp_stream);
+        dbg!(index);
         let token = Token(index.to_usize());
 
         let source = Source {
@@ -300,6 +301,8 @@ impl hyper::rt::Read for TcpStream {
         cx: &mut Context<'_>,
         mut buf: ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
+        log::info!("poll_read");
+
         const TMP_BUF_LEN: usize = 1024;
         use std::io::Read;
 
@@ -308,10 +311,12 @@ impl hyper::rt::Read for TcpStream {
         let remaining = buf_mut.len().min(TMP_BUF_LEN);
 
         let poll = self.poll_io(
-            Direction::Write,
+            Direction::Read,
             || (&self.tcp_stream).read(&mut tmp_buf[..remaining]),
             cx,
         );
+
+        dbg!(&poll);
 
         let n = std::task::ready!(poll)?;
         let tmp_buf = tmp_buf.map(MaybeUninit::new);
@@ -322,6 +327,7 @@ impl hyper::rt::Read for TcpStream {
             buf.advance(n);
         }
 
+        log::info!("poll_read {n}");
         Poll::Ready(Ok(()))
     }
 }
@@ -332,7 +338,16 @@ impl hyper::rt::Write for TcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
-        self.poll_io(Direction::Write, || (&self.tcp_stream).write(buf), cx)
+        log::info!("poll_write");
+        let n = std::task::ready!(self.poll_io(
+            Direction::Write,
+            || (&self.tcp_stream).write(buf),
+            cx
+        ))?;
+
+        dbg!(std::str::from_utf8(&buf[..n]));
+
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
