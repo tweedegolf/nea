@@ -37,7 +37,7 @@ fn main() {
 
                 match app(tcp_stream).await {
                     Ok(()) => {}
-                    Err(e) => match dbg!(e.kind()) {
+                    Err(e) => match e.kind() {
                         ErrorKind::NotConnected => {}
                         _ => Err(e).unwrap(),
                     },
@@ -110,6 +110,7 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     log::info!("built request");
 
     let res = sender.send_request(req).await.unwrap();
+    let _ = res;
 
     let mut buffer = [0u8; 1024];
     let mut response = Cursor::new(&mut buffer[..]);

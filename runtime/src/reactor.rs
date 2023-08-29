@@ -65,11 +65,9 @@ impl Reactor {
         index: Index,
         tcp_stream: std::net::TcpStream,
     ) -> std::io::Result<TcpStream> {
-        // TODO this line caused some invalid file descriptor error
-        // tcp_stream.set_nonblocking(true).unwrap();
+        tcp_stream.set_nonblocking(true).unwrap();
 
         let mut tcp_stream = mio::net::TcpStream::from_std(tcp_stream);
-        dbg!(index);
         let token = Token(index.to_usize());
 
         let source = Source {
@@ -289,8 +287,6 @@ impl hyper::rt::Read for TcpStream {
         let remaining = buf_mut.len().min(TMP_BUF_LEN);
 
         let poll = self.poll_io(|| (&self.tcp_stream).read(&mut tmp_buf[..remaining]), cx);
-
-        dbg!(&poll);
 
         let n = std::task::ready!(poll)?;
         let tmp_buf = tmp_buf.map(MaybeUninit::new);
