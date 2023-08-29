@@ -4,7 +4,7 @@ use std::{
     os::fd::AsRawFd,
 };
 
-use runtime::{reactor, Index, IoResources};
+use runtime::{reactor, BucketIndex, IoResources, QueueIndex};
 
 fn main() {
     env_logger::init();
@@ -39,7 +39,8 @@ fn main() {
             Some(index) => executor.execute(index, async move {
                 log::info!("new connection {i} (index = {}, fd = {fd})", index.index);
 
-                let tcp_stream = reactor.register(index, stream).unwrap();
+                let queue_index = QueueIndex::from_bucket_index(io_resources, index);
+                let tcp_stream = reactor.register(queue_index, stream).unwrap();
 
                 match app(tcp_stream).await {
                     Ok(()) => {}
@@ -86,7 +87,7 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
 
-    let index = Index {
+    let index = BucketIndex {
         identifier: 0,
         index: 0,
     };

@@ -15,7 +15,7 @@ use std::{
 
 use mio::{Events, Interest, Token};
 
-use crate::{Index, IoResources};
+use crate::{IoResources, QueueIndex};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -73,7 +73,7 @@ impl Reactor {
 
     pub fn register(
         &self,
-        index: Index,
+        index: QueueIndex,
         tcp_stream: std::net::TcpStream,
     ) -> std::io::Result<TcpStream> {
         tcp_stream.set_nonblocking(true).unwrap();
@@ -192,7 +192,7 @@ impl Shared {
         }
 
         for event in events.iter() {
-            let task_index = Index::from_usize(event.token().0);
+            let task_index = QueueIndex::from_usize(event.token().0);
             let index = task_index.index as usize;
             let source = self.sources[index].lock().unwrap();
 
@@ -244,7 +244,7 @@ impl TcpStream {
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<T>> {
         loop {
-            let index = Index::from_usize(self.token.0);
+            let index = QueueIndex::from_usize(self.token.0);
 
             let source_guard = self.reactor.shared.sources[index.index as usize]
                 .lock()
@@ -368,7 +368,7 @@ impl hyper::rt::Write for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let index = Index::from_usize(self.token.0).index as usize;
+        let index = QueueIndex::from_usize(self.token.0).index as usize;
         log::info!("token {} removed from poll", index);
 
         let _ = self
