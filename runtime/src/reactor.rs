@@ -41,19 +41,17 @@ impl Reactor {
     }
 
     pub fn get_or_init(bucket_count: usize, io_resources: IoResources) -> std::io::Result<Self> {
-        let queue_capacity =
-            bucket_count * (io_resources.tcp_streams + io_resources.http_connections);
-
         match SHARED.get() {
             None => {
+                let queue_capacity = bucket_count * io_resources.per_bucket();
                 let poll = mio::Poll::new()?;
 
                 let shared = Shared {
-                    io_resources,
                     registry: poll.registry().try_clone()?,
                     sources: std::iter::repeat_with(|| Mutex::new(None))
                         .take(queue_capacity)
                         .collect(),
+                    io_resources,
                 };
 
                 let shared = SHARED.get_or_init(|| shared);
@@ -159,9 +157,7 @@ unsafe impl Sync for Shared {}
 
 impl Shared {
     fn run(&self, mut poll: mio::Poll) -> std::io::Result<()> {
-        let queue_capacity = self.sources.len()
-            * (self.io_resources.tcp_streams + self.io_resources.http_connections);
-
+        let queue_capacity = self.sources.len() * self.io_resources.per_bucket();
         let mut events = Events::with_capacity(queue_capacity);
         let mut wakers = Vec::with_capacity(queue_capacity);
 
