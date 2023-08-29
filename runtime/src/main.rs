@@ -117,10 +117,9 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     log::info!("built request");
 
     let res = sender.send_request(req).await.unwrap();
-    let _ = res;
+    log::info!("sent request");
 
     // Stream the body, writing each frame to stdout as it arrives
-    let res: () = res;
     dbg!(res.into_body());
 
     let mut buffer = [0u8; 1024];
