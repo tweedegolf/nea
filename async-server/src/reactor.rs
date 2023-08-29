@@ -119,7 +119,7 @@ impl Reactor {
         direction: Direction,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if source.triggered[direction as usize].load(Ordering::Acquire) {
+        if source.triggered[direction as usize].swap(false, Ordering::AcqRel) {
             return Poll::Ready(Ok(()));
         }
 
@@ -144,10 +144,6 @@ impl Reactor {
         }
 
         Poll::Pending
-    }
-
-    fn clear_trigger(&self, source: &Source, direction: Direction) {
-        source.triggered[direction as usize].store(false, Ordering::Release);
     }
 }
 
@@ -267,7 +263,9 @@ impl TcpStream {
 
             match f() {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.reactor.clear_trigger(source, direction);
+                    // Should have been able to continue due to `poll_ready` succeeding, but failed
+                    // anyway. Retry the whole thing in a loop. While futures shouldn't block in a
+                    // loop, the assumption is that this branch matches very rarely.
                 }
                 val => {
                     return Poll::Ready(val);
