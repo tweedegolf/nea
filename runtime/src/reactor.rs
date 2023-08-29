@@ -1,5 +1,9 @@
 // https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 
+use hyper::rt::ReadBufCursor;
+use std::io::Error;
+use std::mem::MaybeUninit;
+use std::pin::Pin;
 use std::{
     io::Write,
     sync::{
@@ -11,7 +15,7 @@ use std::{
 
 use mio::{Events, Interest, Token};
 
-use crate::Index;
+use crate::{IoResources, QueueIndex};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -29,20 +33,26 @@ pub struct Reactor {
     shared: &'static Shared,
 }
 
-impl Reactor {
-    const CAPACITY: usize = 64;
+static SHARED: OnceLock<Shared> = OnceLock::new();
 
-    pub fn get() -> std::io::Result<Self> {
-        static SHARED: OnceLock<Shared> = OnceLock::new();
+impl Reactor {
+    pub fn get() -> Option<Self> {
+        SHARED.get().map(|shared| Reactor { shared })
+    }
+
+    pub fn get_or_init(bucket_count: usize, io_resources: IoResources) -> std::io::Result<Self> {
+        let queue_capacity =
+            bucket_count * (io_resources.tcp_streams + io_resources.http_connections);
 
         match SHARED.get() {
             None => {
                 let poll = mio::Poll::new()?;
 
                 let shared = Shared {
+                    io_resources,
                     registry: poll.registry().try_clone()?,
                     sources: std::iter::repeat_with(|| Mutex::new(None))
-                        .take(Self::CAPACITY)
+                        .take(queue_capacity)
                         .collect(),
                 };
 
@@ -63,11 +73,10 @@ impl Reactor {
 
     pub fn register(
         &self,
-        index: Index,
+        index: QueueIndex,
         tcp_stream: std::net::TcpStream,
     ) -> std::io::Result<TcpStream> {
-        // TODO this line caused some invalid file descriptor error
-        // tcp_stream.set_nonblocking(true).unwrap();
+        tcp_stream.set_nonblocking(true).unwrap();
 
         let mut tcp_stream = mio::net::TcpStream::from_std(tcp_stream);
         let token = Token(index.to_usize());
@@ -143,14 +152,18 @@ impl Reactor {
 struct Shared {
     registry: mio::Registry,
     sources: Vec<Mutex<Option<Source>>>,
+    io_resources: IoResources,
 }
 
 unsafe impl Sync for Shared {}
 
 impl Shared {
     fn run(&self, mut poll: mio::Poll) -> std::io::Result<()> {
-        let mut events = Events::with_capacity(Reactor::CAPACITY);
-        let mut wakers = Vec::with_capacity(Reactor::CAPACITY);
+        let queue_capacity = self.sources.len()
+            * (self.io_resources.tcp_streams + self.io_resources.http_connections);
+
+        let mut events = Events::with_capacity(queue_capacity);
+        let mut wakers = Vec::with_capacity(queue_capacity);
 
         loop {
             if let Err(err) = self.poll(&mut poll, &mut events, &mut wakers) {
@@ -179,7 +192,7 @@ impl Shared {
         }
 
         for event in events.iter() {
-            let task_index = Index::from_usize(event.token().0);
+            let task_index = QueueIndex::from_usize(event.token().0);
             let index = task_index.index as usize;
             let source = self.sources[index].lock().unwrap();
 
@@ -231,7 +244,7 @@ impl TcpStream {
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<T>> {
         loop {
-            let index = Index::from_usize(self.token.0);
+            let index = QueueIndex::from_usize(self.token.0);
 
             let source_guard = self.reactor.shared.sources[index.index as usize]
                 .lock()
@@ -261,7 +274,7 @@ impl TcpStream {
         use std::io::Read;
 
         std::future::poll_fn(|cx| {
-            self.poll_io(Direction::Write, || (&self.tcp_stream).read(buf), cx)
+            self.poll_io(Direction::Read, || (&self.tcp_stream).read(buf), cx)
         })
         .await
     }
@@ -290,9 +303,74 @@ impl TcpStream {
     }
 }
 
+impl hyper::rt::Read for TcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        const TMP_BUF_LEN: usize = 1024;
+        use std::io::Read;
+
+        let buf_mut = unsafe { buf.as_mut() };
+        let mut tmp_buf = [0; TMP_BUF_LEN];
+        let remaining = buf_mut.len().min(TMP_BUF_LEN);
+
+        let poll = self.poll_io(
+            Direction::Read,
+            || (&self.tcp_stream).read(&mut tmp_buf[..remaining]),
+            cx,
+        );
+
+        let n = std::task::ready!(poll)?;
+        let tmp_buf = tmp_buf.map(MaybeUninit::new);
+
+        buf_mut[..n].copy_from_slice(&tmp_buf[..n]);
+
+        dbg!("read", n);
+
+        unsafe {
+            buf.advance(n);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl hyper::rt::Write for TcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        log::info!("poll_write");
+        let n = std::task::ready!(self.poll_io(
+            Direction::Write,
+            || (&self.tcp_stream).write(buf),
+            cx
+        ))?;
+
+        dbg!(std::str::from_utf8(&buf[..n]));
+
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.poll_io(Direction::Write, || (&self.tcp_stream).flush(), cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.poll_io(
+            Direction::Write,
+            || self.tcp_stream.shutdown(std::net::Shutdown::Both),
+            cx,
+        )
+    }
+}
+
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let index = Index::from_usize(self.token.0).index as usize;
+        let index = QueueIndex::from_usize(self.token.0).index as usize;
         log::info!("token {} removed from poll", index);
 
         let _ = self
