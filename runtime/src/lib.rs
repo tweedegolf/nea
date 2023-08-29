@@ -1,7 +1,7 @@
-pub mod reactor;
-
 // https://github.com/Hexilee/async-io-demo/blob/master/src/executor.rs
-//https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
+// https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
+
+use serde::Deserialize;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -9,10 +9,16 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Mutex, OnceLock,
+        Mutex, OnceLock,
     },
     task::{Context, RawWaker, RawWakerVTable, Waker},
 };
+
+mod config;
+pub mod reactor;
+mod server;
+
+pub use server::Nea;
 
 const RAW_WAKER_V_TABLE: RawWakerVTable = {
     fn clone_raw(ptr: *const ()) -> RawWaker {
@@ -44,25 +50,6 @@ const RAW_WAKER_V_TABLE: RawWakerVTable = {
 
 pub struct Executor<F: 'static> {
     inner: &'static Inner<F>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IoResources {
-    pub tcp_streams: usize,
-    pub http_connections: usize,
-}
-
-impl IoResources {
-    #[inline]
-    const fn per_bucket(self) -> usize {
-        self.tcp_streams + self.http_connections
-    }
-
-    const fn http_connections(self, bucket_index: BucketIndex) -> Range<usize> {
-        let start = bucket_index.index as usize * self.http_connections;
-
-        start..(start + self.http_connections)
-    }
 }
 
 #[derive(Debug)]
@@ -104,8 +91,8 @@ enum Slot<T> {
     Occupied(T),
 }
 
-unsafe impl<F: Send> std::marker::Send for Inner<F> {}
-unsafe impl<F: Send> std::marker::Sync for Inner<F> {}
+unsafe impl<F: Send> Send for Inner<F> {}
+unsafe impl<F: Send> Sync for Inner<F> {}
 
 #[repr(C)]
 struct Task<F> {
@@ -194,14 +181,11 @@ where
     pub fn get_or_init(bucket_count: usize, io_resources: IoResources) -> Self {
         match INNER.get() {
             None => {
-                let queue_capacity =
-                    bucket_count * (io_resources.tcp_streams + io_resources.http_connections);
-
-                let filled = Mutex::new(std::iter::repeat(false).take(bucket_count).collect());
-
+                let queue_capacity = bucket_count * io_resources.per_bucket();
                 let futures = std::iter::repeat_with(|| Mutex::new(None))
-                    .take(bucket_count)
+                    .take(queue_capacity)
                     .collect();
+                let filled = Mutex::new(std::iter::repeat(false).take(queue_capacity).collect());
 
                 let connection_count = bucket_count * io_resources.http_connections;
                 let connections = std::iter::repeat_with(|| Mutex::new(Slot::Empty))
@@ -353,6 +337,34 @@ impl QueueIndex {
 
     fn from_ptr(ptr: *const ()) -> Self {
         Self::from_usize(ptr as usize)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct IoResources {
+    pub tcp_streams: usize,
+    pub http_connections: usize,
+}
+
+impl IoResources {
+    #[inline]
+    const fn per_bucket(self) -> usize {
+        self.tcp_streams + self.http_connections
+    }
+
+    const fn http_connections(self, bucket_index: BucketIndex) -> Range<usize> {
+        let start = bucket_index.index as usize * self.http_connections;
+
+        start..(start + self.http_connections)
+    }
+}
+
+impl Default for IoResources {
+    fn default() -> Self {
+        IoResources {
+            tcp_streams: 1,
+            http_connections: 0,
+        }
     }
 }
 
