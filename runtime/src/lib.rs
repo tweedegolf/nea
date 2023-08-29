@@ -65,6 +65,7 @@ impl IoResources {
     }
 }
 
+#[derive(Debug)]
 enum IoIndex {
     // a bucket index
     InputStream(BucketIndex),
@@ -78,12 +79,10 @@ impl IoIndex {
         let index = queue_index.index as usize;
         let total_per_bucket = resources.tcp_streams + resources.http_connections;
 
-        let bucket_index = index / total_per_bucket;
-
         match index % total_per_bucket {
             0 => IoIndex::InputStream(queue_index.to_bucket_index(resources)),
             n if (1..resources.tcp_streams).contains(&n) => todo!(),
-            n => IoIndex::HttpConnection(queue_index.to_connection_index(resources)),
+            _ => IoIndex::HttpConnection(queue_index.to_connection_index(resources)),
         }
     }
 }
@@ -298,7 +297,8 @@ impl QueueIndex {
 
     fn to_connection_index(&self, io_resources: IoResources) -> ConnectionIndex {
         let bucket_index = self.index / io_resources.per_bucket() as u32;
-        let connection = self.index % io_resources.per_bucket() as u32;
+        let connection =
+            self.index % io_resources.per_bucket() as u32 - io_resources.tcp_streams as u32;
 
         ConnectionIndex {
             identifier: self.identifier,
@@ -364,7 +364,8 @@ where
         loop {
             let queue_index = self.queue.blocking_dequeue();
 
-            match IoIndex::from_index(self.io_resources, queue_index) {
+            dbg!(queue_index);
+            match dbg!(IoIndex::from_index(self.io_resources, queue_index)) {
                 IoIndex::InputStream(bucket_index) => {
                     let mut task_mut = self.futures[bucket_index.index as usize].lock().unwrap();
 
