@@ -5,7 +5,7 @@ pub mod reactor;
 use std::{
     collections::VecDeque,
     future::Future,
-    ops::DerefMut,
+    ops::{DerefMut, Range},
     pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -13,8 +13,6 @@ use std::{
     },
     task::{Context, RawWaker, RawWakerVTable, Waker},
 };
-
-const QUEUE_CAPACITY: usize = 64;
 
 const RAW_WAKER_V_TABLE: RawWakerVTable = {
     fn clone_raw(ptr: *const ()) -> RawWaker {
@@ -30,13 +28,13 @@ const RAW_WAKER_V_TABLE: RawWakerVTable = {
     }
 
     fn wake(ptr: *const ()) {
-        let index = Index::from_ptr(ptr);
+        let index = QueueIndex::from_ptr(ptr);
         log::trace!("wake {}", index.index);
 
         // NOTE: the unit here is a lie! we just don't know the correct type for the future here
         let executor = Executor::<()>::get().unwrap();
 
-        if executor.inner.queue.enqueue(Job::Index(index)).is_err() {
+        if executor.inner.queue.enqueue(index).is_err() {
             log::warn!("task cannot be woken because the queue is full! ");
         }
     }
@@ -48,67 +46,44 @@ pub struct Executor<F: 'static> {
     inner: &'static Inner<F>,
 }
 
-struct Connection {
-    connection: Mutex<hyper::client::conn::http1::Connection<reactor::TcpStream, String>>,
-    identifier: u32,
-}
-
-impl std::task::Wake for Connection {
-    fn wake(self: Arc<Self>) {
-        log::trace!("wake {}", self.identifier);
-
-        let job = Job::Connection(self);
-
-        // NOTE: the unit here is a lie! we just don't know the correct type for the future here
-        let executor = Executor::<()>::get().unwrap();
-
-        if executor.inner.queue.enqueue(job).is_err() {
-            log::warn!("task cannot be woken because the queue is full! ");
-        }
-    }
-}
-
-enum Job {
-    Index(Index),
-    Connection(Arc<Connection>),
-}
-
-impl PartialEq for Job {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Index(l0), Self::Index(r0)) => l0 == r0,
-            (Self::Connection(l0), Self::Connection(r0)) => l0.identifier == r0.identifier,
-            _ => false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoResources {
     pub tcp_streams: usize,
     pub http_connections: usize,
 }
 
+impl IoResources {
+    #[inline]
+    const fn per_bucket(self) -> usize {
+        self.tcp_streams + self.http_connections
+    }
+
+    const fn http_connections(self, bucket_index: BucketIndex) -> Range<usize> {
+        let start = bucket_index.index as usize * self.http_connections;
+
+        start..(start + self.http_connections)
+    }
+}
+
 enum IoIndex {
     // a bucket index
-    InputStream(usize),
+    InputStream(BucketIndex),
     CustomStream(usize),
     // an index into the global vector of http connection futures
-    HttpConnection(usize),
+    HttpConnection(ConnectionIndex),
 }
 
 impl IoIndex {
-    fn from_index(resources: IoResources, index: usize) -> Self {
+    fn from_index(resources: IoResources, queue_index: QueueIndex) -> Self {
+        let index = queue_index.index as usize;
         let total_per_bucket = resources.tcp_streams + resources.http_connections;
 
         let bucket_index = index / total_per_bucket;
 
         match index % total_per_bucket {
-            0 => IoIndex::InputStream(bucket_index),
+            0 => IoIndex::InputStream(queue_index.to_bucket_index(resources)),
             n if (1..resources.tcp_streams).contains(&n) => todo!(),
-            n => IoIndex::HttpConnection(
-                bucket_index * resources.http_connections + (n - resources.tcp_streams),
-            ),
+            n => IoIndex::HttpConnection(queue_index.to_connection_index(resources)),
         }
     }
 }
@@ -119,9 +94,15 @@ struct Inner<F> {
     io_resources: IoResources,
     filled: Mutex<Box<[bool]>>,
     futures: Box<[Mutex<Option<Task<F>>>]>,
-    connections: Box<[Mutex<Option<Http1Connection>>]>,
-    queue: SimpleQueue<Job>,
+    connections: Box<[Mutex<Slot<Http1Connection>>]>,
+    queue: SimpleQueue<QueueIndex>,
     identifier: AtomicU32,
+}
+
+enum Slot<T> {
+    Empty,
+    Reserved,
+    Occupied(T),
 }
 
 unsafe impl<F: Send> std::marker::Send for Inner<F> {}
@@ -146,31 +127,54 @@ impl<F> Executor<F> {
 
     pub async fn handshake(
         &self,
-        index: Index,
+        bucket_index: BucketIndex,
         host: &str,
         port: u16,
     ) -> std::io::Result<hyper::client::conn::http1::SendRequest<String>> {
         let stream = std::net::TcpStream::connect(format!("{}:{}", host, port)).unwrap();
         stream.set_nonblocking(true)?;
 
-        let reactor = reactor::Reactor::get().unwrap();
-        let tcp_index = Index {
-            identifier: index.identifier,
-            index: 2,
+        let indices = self.inner.io_resources.http_connections(bucket_index);
+        let connection_index = indices.start;
+
+        let mut opt_connection_offset = None;
+
+        for (i, slot) in self.inner.connections[indices].iter().enumerate() {
+            let Ok(mut slot) = slot.try_lock() else {
+                continue;
+            };
+
+            match slot.deref_mut() {
+                Slot::Empty => *slot = Slot::Reserved,
+                Slot::Reserved | Slot::Occupied(_) => continue,
+            }
+
+            opt_connection_offset = Some(i);
+            break;
+        }
+
+        let Some(i) = opt_connection_offset else {
+            todo!("no free connection slot");
         };
 
-        let stream = reactor.register(tcp_index, stream).unwrap();
+        let connection_index = ConnectionIndex {
+            identifier: bucket_index.identifier,
+            index: (connection_index + i) as u32,
+        };
+
+        let reactor = reactor::Reactor::get().unwrap();
+
+        let queue_index =
+            QueueIndex::from_connection_index(self.inner.io_resources, connection_index);
+        let stream = reactor.register(queue_index, stream).unwrap();
 
         let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
 
-        let connection = Connection {
-            connection: Mutex::new(conn),
-            identifier: index.identifier,
-        };
+        *self.inner.connections[connection_index.index as usize]
+            .try_lock()
+            .unwrap() = Slot::Occupied(conn);
 
-        let job = Job::Connection(Arc::new(connection));
-
-        if self.inner.queue.enqueue(job).is_err() {
+        if self.inner.queue.enqueue(queue_index).is_err() {
             log::warn!("connection cannot be started because the queue is full! ");
         }
 
@@ -201,7 +205,7 @@ where
                     .collect();
 
                 let connection_count = bucket_count * io_resources.http_connections;
-                let connections = std::iter::repeat_with(|| Mutex::new(None))
+                let connections = std::iter::repeat_with(|| Mutex::new(Slot::Empty))
                     .take(connection_count)
                     .collect();
 
@@ -213,7 +217,7 @@ where
                     futures,
                     connections,
                     queue,
-                    identifier: AtomicU32::new(1),
+                    identifier: AtomicU32::new(0),
                 };
 
                 let boxed = Box::new(inner);
@@ -243,11 +247,11 @@ where
             .spawn(|| inner.run())
     }
 
-    pub fn try_claim(&self) -> Option<Index> {
+    pub fn try_claim(&self) -> Option<BucketIndex> {
         self.inner.try_claim()
     }
 
-    pub fn execute(&self, index: Index, fut: F) {
+    pub fn execute(&self, index: BucketIndex, fut: F) {
         let task = Task {
             fut,
             identifier: index.identifier,
@@ -255,7 +259,8 @@ where
 
         self.inner.set(index, task);
 
-        match self.inner.queue.enqueue(Job::Index(index)) {
+        let queue_index = QueueIndex::from_bucket_index(self.inner.io_resources, index);
+        match self.inner.queue.enqueue(queue_index) {
             Ok(()) => (),
             Err(_) => unreachable!("we claimed a spot!"),
         }
@@ -264,22 +269,74 @@ where
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Index {
+pub struct ConnectionIndex {
     pub identifier: u32,
     pub index: u32,
 }
 
-impl Index {
-    const fn to_usize(self) -> usize {
-        let a = self.identifier.to_ne_bytes();
-        let b = self.index.to_ne_bytes();
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketIndex {
+    pub identifier: u32,
+    pub index: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueIndex {
+    pub identifier: u32,
+    pub index: u32,
+}
+
+impl QueueIndex {
+    fn to_bucket_index(&self, io_resources: IoResources) -> BucketIndex {
+        BucketIndex {
+            identifier: self.identifier,
+            index: self.index / io_resources.per_bucket() as u32,
+        }
+    }
+
+    fn to_connection_index(&self, io_resources: IoResources) -> ConnectionIndex {
+        let bucket_index = self.index / io_resources.per_bucket() as u32;
+        let connection = self.index % io_resources.per_bucket() as u32;
+
+        ConnectionIndex {
+            identifier: self.identifier,
+            index: bucket_index * io_resources.http_connections as u32 + connection,
+        }
+    }
+
+    pub fn from_bucket_index(io_resources: IoResources, bucket_index: BucketIndex) -> Self {
+        Self {
+            identifier: bucket_index.identifier,
+            index: bucket_index.index * io_resources.per_bucket() as u32,
+        }
+    }
+
+    fn from_connection_index(io_resources: IoResources, connection_index: ConnectionIndex) -> Self {
+        let bucket_index = connection_index.index / io_resources.http_connections as u32;
+        let connection = connection_index.index % io_resources.http_connections as u32;
+
+        let queue_index = bucket_index * io_resources.per_bucket() as u32
+            + io_resources.tcp_streams as u32
+            + connection;
+
+        Self {
+            identifier: connection_index.identifier,
+            index: queue_index,
+        }
+    }
+
+    fn to_usize(self) -> usize {
+        let a = self.index.to_ne_bytes();
+        let b = self.identifier.to_ne_bytes();
 
         let bytes = [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]];
 
         usize::from_ne_bytes(bytes)
     }
 
-    pub const fn to_ptr(self) -> *const () {
+    pub fn to_ptr(self) -> *const () {
         self.to_usize() as *const ()
     }
 
@@ -288,8 +345,8 @@ impl Index {
 
         let [a0, a1, a2, a3, b0, b1, b2, b3] = bytes;
 
-        let identifier = u32::from_ne_bytes([a0, a1, a2, a3]);
-        let index = u32::from_ne_bytes([b0, b1, b2, b3]);
+        let index = u32::from_ne_bytes([a0, a1, a2, a3]);
+        let identifier = u32::from_ne_bytes([b0, b1, b2, b3]);
 
         Self { identifier, index }
     }
@@ -305,42 +362,52 @@ where
 {
     fn run(&self) {
         loop {
-            let job = self.queue.blocking_dequeue();
+            let queue_index = self.queue.blocking_dequeue();
 
-            match job {
-                Job::Index(task_index) => {
-                    let mut task_mut = self.futures[task_index.index as usize].lock().unwrap();
+            match IoIndex::from_index(self.io_resources, queue_index) {
+                IoIndex::InputStream(bucket_index) => {
+                    let mut task_mut = self.futures[bucket_index.index as usize].lock().unwrap();
 
                     let task = match task_mut.as_mut() {
                         None => continue,
-                        Some(task) if task.identifier != task_index.identifier => continue,
+                        Some(task) if task.identifier != queue_index.identifier => continue,
                         Some(inner) => inner,
                     };
 
                     let pinned = unsafe { Pin::new_unchecked(&mut task.fut) };
 
-                    let raw_waker = RawWaker::new(task_index.to_ptr(), &RAW_WAKER_V_TABLE);
+                    let raw_waker = RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
                     let waker = unsafe { Waker::from_raw(raw_waker) };
                     let mut cx = Context::from_waker(&waker);
 
                     match pinned.poll(&mut cx) {
                         std::task::Poll::Ready(_) => {
                             // allright, future is done, free up its spot in the slab
-                            log::info!("task {} is done", task_index.index);
+                            log::info!("task {} is done", bucket_index.index);
                             drop(task_mut);
-                            self.remove(task_index);
+                            self.remove(queue_index.to_bucket_index(self.io_resources));
                         }
                         std::task::Poll::Pending => {
                             // keep the future in the slab
                         }
                     }
                 }
-                Job::Connection(task) => {
-                    let waker = std::task::Waker::from(task.clone());
-                    let mut cx = Context::from_waker(&waker);
+                IoIndex::CustomStream(_) => todo!(),
+                IoIndex::HttpConnection(connection_index) => {
+                    let mut task_mut = self.connections[connection_index.index as usize]
+                        .lock()
+                        .unwrap();
 
-                    let mut locked = task.connection.lock().unwrap();
-                    let pinned = unsafe { Pin::new_unchecked(locked.deref_mut()) };
+                    let connection = match task_mut.deref_mut() {
+                        Slot::Empty | Slot::Reserved => continue,
+                        Slot::Occupied(inner) => inner,
+                    };
+
+                    let pinned = unsafe { Pin::new_unchecked(connection) };
+
+                    let raw_waker = RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
+                    let waker = unsafe { Waker::from_raw(raw_waker) };
+                    let mut cx = Context::from_waker(&waker);
 
                     match pinned.poll(&mut cx) {
                         std::task::Poll::Ready(_) => {
@@ -355,7 +422,7 @@ where
         }
     }
 
-    fn try_claim(&self) -> Option<Index> {
+    fn try_claim(&self) -> Option<BucketIndex> {
         let mut guard = self.filled.lock().unwrap();
         let index = guard.iter().position(|filled| !filled)?;
 
@@ -364,10 +431,10 @@ where
         let identifier = self.identifier.fetch_add(1, Ordering::Relaxed);
         let index = index as u32;
 
-        Some(Index { identifier, index })
+        Some(BucketIndex { identifier, index })
     }
 
-    fn set(&self, index: Index, value: Task<F>) {
+    fn set(&self, index: BucketIndex, value: Task<F>) {
         let old = self.futures[index.index as usize]
             .try_lock()
             .unwrap()
@@ -375,7 +442,7 @@ where
         debug_assert!(old.is_none());
     }
 
-    fn remove(&self, index: Index) {
+    fn remove(&self, index: BucketIndex) {
         let mut guard = self.filled.lock().unwrap();
 
         loop {
