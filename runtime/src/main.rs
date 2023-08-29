@@ -4,13 +4,19 @@ use std::{
     os::fd::AsRawFd,
 };
 
-use runtime::{reactor, Index};
+use runtime::{reactor, Index, IoResources};
 
 fn main() {
     env_logger::init();
 
-    let executor = runtime::Executor::get_or_init();
-    let reactor = runtime::reactor::Reactor::get().unwrap();
+    let bucket_count = 64;
+    let io_resources = IoResources {
+        tcp_streams: 1,
+        http_connections: 4,
+    };
+
+    let executor = runtime::Executor::get_or_init(bucket_count, io_resources);
+    let reactor = runtime::reactor::Reactor::get_or_init(bucket_count, io_resources).unwrap();
 
     let _handle1 = executor.spawn_worker().unwrap();
     // let _handle2 = executor.spawn_worker().unwrap();

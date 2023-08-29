@@ -83,9 +83,43 @@ impl PartialEq for Job {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoResources {
+    pub tcp_streams: usize,
+    pub http_connections: usize,
+}
+
+enum IoIndex {
+    // a bucket index
+    InputStream(usize),
+    CustomStream(usize),
+    // an index into the global vector of http connection futures
+    HttpConnection(usize),
+}
+
+impl IoIndex {
+    fn from_index(resources: IoResources, index: usize) -> Self {
+        let total_per_bucket = resources.tcp_streams + resources.http_connections;
+
+        let bucket_index = index / total_per_bucket;
+
+        match index % total_per_bucket {
+            0 => IoIndex::InputStream(bucket_index),
+            n if (1..resources.tcp_streams).contains(&n) => todo!(),
+            n => IoIndex::HttpConnection(
+                bucket_index * resources.http_connections + (n - resources.tcp_streams),
+            ),
+        }
+    }
+}
+
+type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
+
 struct Inner<F> {
-    futures: Box<[Mutex<Option<Task<F>>>]>,
+    io_resources: IoResources,
     filled: Mutex<Box<[bool]>>,
+    futures: Box<[Mutex<Option<Task<F>>>]>,
+    connections: Box<[Mutex<Option<Http1Connection>>]>,
     queue: SimpleQueue<Job>,
     identifier: AtomicU32,
 }
@@ -154,19 +188,30 @@ where
     {
     }
 
-    pub fn get_or_init() -> Self {
+    pub fn get_or_init(bucket_count: usize, io_resources: IoResources) -> Self {
         match INNER.get() {
             None => {
-                let futures = std::iter::repeat_with(|| Mutex::new(None))
-                    .take(QUEUE_CAPACITY)
-                    .collect();
-                let filled = Mutex::new(std::iter::repeat(false).take(QUEUE_CAPACITY).collect());
+                let queue_capacity =
+                    bucket_count * (io_resources.tcp_streams + io_resources.http_connections);
 
-                let queue = SimpleQueue::with_capacity(QUEUE_CAPACITY);
+                let filled = Mutex::new(std::iter::repeat(false).take(bucket_count).collect());
+
+                let futures = std::iter::repeat_with(|| Mutex::new(None))
+                    .take(bucket_count)
+                    .collect();
+
+                let connection_count = bucket_count * io_resources.http_connections;
+                let connections = std::iter::repeat_with(|| Mutex::new(None))
+                    .take(connection_count)
+                    .collect();
+
+                let queue = SimpleQueue::with_capacity(queue_capacity);
 
                 let inner = Inner {
-                    futures,
+                    io_resources,
                     filled,
+                    futures,
+                    connections,
                     queue,
                     identifier: AtomicU32::new(1),
                 };
@@ -183,7 +228,8 @@ where
 
             Some(inner) => {
                 let ptr: *const () = *inner;
-                let inner = unsafe { &*(ptr.cast()) };
+                let inner: &Inner<F> = unsafe { &*(ptr.cast()) };
+                assert_eq!(io_resources, inner.io_resources);
                 // already initialized
                 Executor { inner }
             }

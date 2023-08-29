@@ -15,7 +15,7 @@ use std::{
 
 use mio::{Events, Interest, Token};
 
-use crate::Index;
+use crate::{Index, IoResources};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -33,20 +33,26 @@ pub struct Reactor {
     shared: &'static Shared,
 }
 
-impl Reactor {
-    const CAPACITY: usize = 64;
+static SHARED: OnceLock<Shared> = OnceLock::new();
 
-    pub fn get() -> std::io::Result<Self> {
-        static SHARED: OnceLock<Shared> = OnceLock::new();
+impl Reactor {
+    pub fn get() -> Option<Self> {
+        SHARED.get().map(|shared| Reactor { shared })
+    }
+
+    pub fn get_or_init(bucket_count: usize, io_resources: IoResources) -> std::io::Result<Self> {
+        let queue_capacity =
+            bucket_count * (io_resources.tcp_streams + io_resources.http_connections);
 
         match SHARED.get() {
             None => {
                 let poll = mio::Poll::new()?;
 
                 let shared = Shared {
+                    io_resources,
                     registry: poll.registry().try_clone()?,
                     sources: std::iter::repeat_with(|| Mutex::new(None))
-                        .take(Self::CAPACITY)
+                        .take(queue_capacity)
                         .collect(),
                 };
 
@@ -146,14 +152,18 @@ impl Reactor {
 struct Shared {
     registry: mio::Registry,
     sources: Vec<Mutex<Option<Source>>>,
+    io_resources: IoResources,
 }
 
 unsafe impl Sync for Shared {}
 
 impl Shared {
     fn run(&self, mut poll: mio::Poll) -> std::io::Result<()> {
-        let mut events = Events::with_capacity(Reactor::CAPACITY);
-        let mut wakers = Vec::with_capacity(Reactor::CAPACITY);
+        let queue_capacity = self.sources.len()
+            * (self.io_resources.tcp_streams + self.io_resources.http_connections);
+
+        let mut events = Events::with_capacity(queue_capacity);
+        let mut wakers = Vec::with_capacity(queue_capacity);
 
         loop {
             if let Err(err) = self.poll(&mut poll, &mut events, &mut wakers) {
@@ -299,8 +309,6 @@ impl hyper::rt::Read for TcpStream {
         cx: &mut Context<'_>,
         mut buf: ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        log::info!("poll_read");
-
         const TMP_BUF_LEN: usize = 1024;
         use std::io::Read;
 
@@ -323,7 +331,6 @@ impl hyper::rt::Read for TcpStream {
             buf.advance(n);
         }
 
-        log::info!("poll_read {n}");
         Poll::Ready(Ok(()))
     }
 }
