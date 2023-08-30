@@ -4,11 +4,12 @@ use std::io::{Cursor, Write};
 use runtime::{reactor, BucketIndex, Nea};
 
 fn main() {
-    if let Err(error) = Nea::new(hyper_app).run() {
+    if let Err(error) = Nea::new(app).run() {
         eprintln!("{error}");
     }
 }
 
+#[allow(unused)]
 async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
@@ -33,6 +34,7 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(unused)]
 async fn hyper_app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
@@ -99,7 +101,7 @@ struct LogSystem(std::alloc::System);
 
 unsafe impl std::alloc::GlobalAlloc for LogSystem {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        eprintln!("allocating {} bytes", layout.size());
+        // eprintln!("allocating {} bytes", layout.size());
         self.0.alloc(layout)
     }
 

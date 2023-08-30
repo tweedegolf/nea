@@ -15,9 +15,11 @@ use std::{
 };
 
 mod config;
+mod index;
 pub mod reactor;
 mod server;
 
+pub use index::{BucketIndex, ConnectionIndex, IoIndex, QueueIndex};
 pub use server::Nea;
 
 const RAW_WAKER_V_TABLE: RawWakerVTable = {
@@ -50,28 +52,6 @@ const RAW_WAKER_V_TABLE: RawWakerVTable = {
 
 pub struct Executor<F: 'static> {
     inner: &'static Inner<F>,
-}
-
-#[derive(Debug)]
-enum IoIndex {
-    // a bucket index
-    InputStream(BucketIndex),
-    CustomStream(usize),
-    // an index into the global vector of http connection futures
-    HttpConnection(ConnectionIndex),
-}
-
-impl IoIndex {
-    fn from_index(resources: IoResources, queue_index: QueueIndex) -> Self {
-        let index = queue_index.index as usize;
-        let total_per_bucket = resources.tcp_streams + resources.http_connections;
-
-        match index % total_per_bucket {
-            0 => IoIndex::InputStream(queue_index.to_bucket_index(resources)),
-            n if (1..resources.tcp_streams).contains(&n) => todo!(),
-            _ => IoIndex::HttpConnection(queue_index.to_connection_index(resources)),
-        }
-    }
 }
 
 type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
@@ -185,7 +165,7 @@ where
                 let futures = std::iter::repeat_with(|| Mutex::new(None))
                     .take(queue_capacity)
                     .collect();
-                let filled = Mutex::new(std::iter::repeat(false).take(queue_capacity).collect());
+                let filled = Mutex::new(std::iter::repeat(false).take(bucket_count).collect());
 
                 let connection_count = bucket_count * io_resources.http_connections;
                 let connections = std::iter::repeat_with(|| Mutex::new(Slot::Empty))
@@ -250,96 +230,6 @@ where
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnectionIndex {
-    pub identifier: u32,
-    pub index: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BucketIndex {
-    pub identifier: u32,
-    pub index: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueueIndex {
-    pub identifier: u32,
-    pub index: u32,
-}
-
-impl QueueIndex {
-    fn to_bucket_index(&self, io_resources: IoResources) -> BucketIndex {
-        BucketIndex {
-            identifier: self.identifier,
-            index: self.index / io_resources.per_bucket() as u32,
-        }
-    }
-
-    fn to_connection_index(&self, io_resources: IoResources) -> ConnectionIndex {
-        let bucket_index = self.index / io_resources.per_bucket() as u32;
-        let connection =
-            self.index % io_resources.per_bucket() as u32 - io_resources.tcp_streams as u32;
-
-        ConnectionIndex {
-            identifier: self.identifier,
-            index: bucket_index * io_resources.http_connections as u32 + connection,
-        }
-    }
-
-    pub fn from_bucket_index(io_resources: IoResources, bucket_index: BucketIndex) -> Self {
-        Self {
-            identifier: bucket_index.identifier,
-            index: bucket_index.index * io_resources.per_bucket() as u32,
-        }
-    }
-
-    fn from_connection_index(io_resources: IoResources, connection_index: ConnectionIndex) -> Self {
-        let bucket_index = connection_index.index / io_resources.http_connections as u32;
-        let connection = connection_index.index % io_resources.http_connections as u32;
-
-        let queue_index = bucket_index * io_resources.per_bucket() as u32
-            + io_resources.tcp_streams as u32
-            + connection;
-
-        Self {
-            identifier: connection_index.identifier,
-            index: queue_index,
-        }
-    }
-
-    fn to_usize(self) -> usize {
-        let a = self.index.to_ne_bytes();
-        let b = self.identifier.to_ne_bytes();
-
-        let bytes = [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]];
-
-        usize::from_ne_bytes(bytes)
-    }
-
-    pub fn to_ptr(self) -> *const () {
-        self.to_usize() as *const ()
-    }
-
-    fn from_usize(word: usize) -> Self {
-        let bytes = word.to_ne_bytes();
-
-        let [a0, a1, a2, a3, b0, b1, b2, b3] = bytes;
-
-        let index = u32::from_ne_bytes([a0, a1, a2, a3]);
-        let identifier = u32::from_ne_bytes([b0, b1, b2, b3]);
-
-        Self { identifier, index }
-    }
-
-    fn from_ptr(ptr: *const ()) -> Self {
-        Self::from_usize(ptr as usize)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct IoResources {
     pub tcp_streams: usize,
@@ -376,8 +266,7 @@ where
         loop {
             let queue_index = self.queue.blocking_dequeue();
 
-            dbg!(queue_index);
-            match dbg!(IoIndex::from_index(self.io_resources, queue_index)) {
+            match IoIndex::from_index(self.io_resources, queue_index) {
                 IoIndex::InputStream(bucket_index) => {
                     let mut task_mut = self.futures[bucket_index.index as usize].lock().unwrap();
 
@@ -468,6 +357,13 @@ where
                     log::info!("could not claim {}", index.index as usize);
                 }
             }
+        }
+
+        for slot in self.connections[self.io_resources.http_connections(index)].iter() {
+            let mut slot = slot.try_lock().unwrap();
+
+            // will drop/clean up the TCP connection
+            *slot = Slot::Empty;
         }
 
         let mut set = false;
