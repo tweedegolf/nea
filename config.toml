@@ -8,3 +8,5 @@ bucket_count = 4
 tcp_streams = 2
 # number of concurrent requests that a handler can perform. Exceeding this limit will cancel the handler and return an error status code
 http_connections = 8
+# http2 needs to keep connections alive. that requires extra futures.
+http2_futures = 1

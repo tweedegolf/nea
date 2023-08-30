@@ -9,6 +9,13 @@ pub struct ConnectionIndex {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http2FutureIndex {
+    pub identifier: u32,
+    pub index: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BucketIndex {
     pub identifier: u32,
     pub index: u32,
@@ -40,6 +47,17 @@ impl QueueIndex {
         }
     }
 
+    pub(crate) fn to_http2_future_index(&self, io_resources: IoResources) -> Http2FutureIndex {
+        let bucket_index = self.index / io_resources.per_bucket() as u32;
+        let connection = self.index % io_resources.per_bucket() as u32
+            - (io_resources.tcp_streams + io_resources.http_connections) as u32;
+
+        Http2FutureIndex {
+            identifier: self.identifier,
+            index: bucket_index * io_resources.http2_futures as u32 + connection,
+        }
+    }
+
     pub fn from_bucket_index(io_resources: IoResources, bucket_index: BucketIndex) -> Self {
         Self {
             identifier: bucket_index.identifier,
@@ -56,6 +74,24 @@ impl QueueIndex {
 
         let queue_index = bucket_index * io_resources.per_bucket() as u32
             + io_resources.tcp_streams as u32
+            + connection;
+
+        Self {
+            identifier: connection_index.identifier,
+            index: queue_index,
+        }
+    }
+
+    pub(crate) fn from_http2_future_index(
+        io_resources: IoResources,
+        connection_index: Http2FutureIndex,
+    ) -> Self {
+        let bucket_index = connection_index.index / io_resources.http2_futures as u32;
+        let connection = connection_index.index % io_resources.http2_futures as u32;
+
+        let queue_index = bucket_index * io_resources.per_bucket() as u32
+            + io_resources.tcp_streams as u32
+            + io_resources.http_connections as u32
             + connection;
 
         Self {
@@ -100,6 +136,8 @@ pub enum IoIndex {
     CustomStream(usize),
     // an index into the global vector of http connection futures
     HttpConnection(ConnectionIndex),
+    // an index into the global vector of http2 futures
+    Http2Future(Http2FutureIndex),
 }
 
 impl IoIndex {
@@ -107,10 +145,22 @@ impl IoIndex {
         let index = queue_index.index as usize;
         let total_per_bucket = resources.tcp_streams + resources.http_connections;
 
+        let tcp_stream_range = 1..resources.tcp_streams;
+        let http_connection_range =
+            tcp_stream_range.end..tcp_stream_range.end + resources.http_connections;
+        let http2_future_range =
+            http_connection_range.end..http_connection_range.end + resources.http2_futures;
+
         match index % total_per_bucket {
             0 => IoIndex::InputStream(queue_index.to_bucket_index(resources)),
-            n if (1..resources.tcp_streams).contains(&n) => todo!(),
-            _ => IoIndex::HttpConnection(queue_index.to_connection_index(resources)),
+            n if tcp_stream_range.contains(&n) => todo!(),
+            n if http_connection_range.contains(&n) => {
+                IoIndex::HttpConnection(queue_index.to_connection_index(resources))
+            }
+            n if http2_future_range.contains(&n) => {
+                IoIndex::Http2Future(queue_index.to_http2_future_index(resources))
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -124,6 +174,7 @@ mod tests {
         let io_resources = IoResources {
             tcp_streams: 1,
             http_connections: 4,
+            http2_futures: 0,
         };
 
         let queue_index = QueueIndex {
@@ -158,6 +209,7 @@ mod tests {
         let io_resources = IoResources {
             tcp_streams: 2,
             http_connections: 4,
+            http2_futures: 1,
         };
 
         let queue_index = QueueIndex {
@@ -188,7 +240,7 @@ mod tests {
 
         let queue_index = QueueIndex {
             identifier: 1,
-            index: 6,
+            index: 7,
         };
 
         assert_eq!(
@@ -205,6 +257,7 @@ mod tests {
         let io_resources = IoResources {
             tcp_streams: 1,
             http_connections: 4,
+            http2_futures: 0,
         };
 
         let queue_index = QueueIndex {
@@ -252,6 +305,7 @@ mod tests {
         let io_resources = IoResources {
             tcp_streams: 1,
             http_connections: 4,
+            http2_futures: 0,
         };
 
         let connection_index = ConnectionIndex {
@@ -305,6 +359,7 @@ mod tests {
         let io_resources = IoResources {
             tcp_streams: 1,
             http_connections: 4,
+            http2_futures: 0,
         };
 
         let bucket_index = BucketIndex {
@@ -340,6 +395,7 @@ mod tests {
         let io_resources = IoResources {
             tcp_streams: 2,
             http_connections: 4,
+            http2_futures: 0,
         };
 
         let bucket_index = BucketIndex {

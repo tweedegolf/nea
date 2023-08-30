@@ -1,6 +1,7 @@
 // https://github.com/Hexilee/async-io-demo/blob/master/src/executor.rs
 // https://github.com/ibraheemdev/astra/blob/53ad0859de7a1e2af90d8ae1a6666c9a7a276c03/src/net.rs#L13
 
+use index::Http2FutureIndex;
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
@@ -55,12 +56,17 @@ pub struct Executor<F: 'static> {
 }
 
 type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
+type Http2Connection =
+    hyper::client::conn::http2::Connection<reactor::TcpStream, String, Executor<()>>;
+
+type PinBoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Inner<F> {
     io_resources: IoResources,
     filled: Mutex<Box<[bool]>>,
     futures: Box<[Mutex<Option<Task<F>>>]>,
     connections: Box<[Mutex<Slot<Http1Connection>>]>,
+    http2_futures: Box<[Mutex<Slot<PinBoxFuture>>]>,
     queue: SimpleQueue<QueueIndex>,
     identifier: AtomicU32,
 }
@@ -81,6 +87,57 @@ struct Task<F> {
 }
 
 static INNER: OnceLock<&()> = OnceLock::new();
+
+impl<F, T> hyper::rt::Executor<F> for Executor<T>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        // TODO get from a thread-local
+        let bucket_index = BucketIndex {
+            index: 0,
+            identifier: 0,
+        };
+
+        // make a future that just always returns unit
+        let future = async move {
+            let _ = future.await;
+        };
+
+        let pinned = Box::pin(future);
+
+        let indices = self.inner.io_resources.http2_futures(bucket_index);
+        let http2_future_start_index = indices.start;
+
+        let lock = self.inner.http2_futures[indices]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| Some((i, slot.try_lock().ok()?)))
+            .find_map(|(i, mut slot)| match slot.deref_mut() {
+                Slot::Empty => Some((i, slot)),
+                Slot::Reserved | Slot::Occupied(_) => None,
+            });
+
+        let Some((i, mut slot)) = lock else {
+            todo!("insufficient space for another http2 future");
+        };
+
+        *slot = Slot::Occupied(pinned);
+
+        let http2_future_index = Http2FutureIndex {
+            identifier: bucket_index.identifier,
+            index: (http2_future_start_index + i) as u32,
+        };
+
+        let queue_index =
+            QueueIndex::from_http2_future_index(self.inner.io_resources, http2_future_index);
+
+        if self.inner.queue.enqueue(queue_index).is_err() {
+            log::warn!("connection cannot be started because the queue is full! ");
+        }
+    }
+}
 
 impl<F> Executor<F> {
     pub fn get() -> Option<Self> {
@@ -172,6 +229,11 @@ where
                     .take(connection_count)
                     .collect();
 
+                let http2_future_count = bucket_count * io_resources.http2_futures;
+                let http2_futures = std::iter::repeat_with(|| Mutex::new(Slot::Empty))
+                    .take(http2_future_count)
+                    .collect();
+
                 let queue = SimpleQueue::with_capacity(queue_capacity);
 
                 let inner = Inner {
@@ -179,6 +241,7 @@ where
                     filled,
                     futures,
                     connections,
+                    http2_futures,
                     queue,
                     identifier: AtomicU32::new(0),
                 };
@@ -234,18 +297,25 @@ where
 pub struct IoResources {
     pub tcp_streams: usize,
     pub http_connections: usize,
+    pub http2_futures: usize,
 }
 
 impl IoResources {
     #[inline]
     const fn per_bucket(self) -> usize {
-        self.tcp_streams + self.http_connections
+        self.tcp_streams + self.http_connections + self.http2_futures
     }
 
     const fn http_connections(self, bucket_index: BucketIndex) -> Range<usize> {
         let start = bucket_index.index as usize * self.http_connections;
 
         start..(start + self.http_connections)
+    }
+
+    const fn http2_futures(self, bucket_index: BucketIndex) -> Range<usize> {
+        let start = bucket_index.index as usize * self.http2_futures;
+
+        start..(start + self.http2_futures)
     }
 }
 
@@ -254,6 +324,7 @@ impl Default for IoResources {
         IoResources {
             tcp_streams: 1,
             http_connections: 0,
+            http2_futures: 0,
         }
     }
 }
@@ -312,6 +383,29 @@ where
                     let mut cx = Context::from_waker(&waker);
 
                     match pinned.poll(&mut cx) {
+                        std::task::Poll::Ready(_) => {
+                            // drop(task_mut);
+                        }
+                        std::task::Poll::Pending => {
+                            // keep the future in the slab
+                        }
+                    }
+                }
+                IoIndex::Http2Future(future_index) => {
+                    let mut task_mut = self.http2_futures[future_index.index as usize]
+                        .lock()
+                        .unwrap();
+
+                    let connection = match task_mut.deref_mut() {
+                        Slot::Empty | Slot::Reserved => continue,
+                        Slot::Occupied(inner) => inner,
+                    };
+
+                    let raw_waker = RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
+                    let waker = unsafe { Waker::from_raw(raw_waker) };
+                    let mut cx = Context::from_waker(&waker);
+
+                    match connection.as_mut().poll(&mut cx) {
                         std::task::Poll::Ready(_) => {
                             // drop(task_mut);
                         }
