@@ -4,7 +4,7 @@ use std::io::{Cursor, Write};
 use runtime::{reactor, BucketIndex, Nea};
 
 fn main() {
-    if let Err(error) = Nea::new(app).run() {
+    if let Err(error) = Nea::new(hyper_app).run() {
         eprintln!("{error}");
     }
 }
@@ -47,7 +47,7 @@ async fn hyper_app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
         index: 0,
     };
 
-    let url = "http://docs.rs/h2/latest/h2/"
+    let url = "https://github.com/hyperium/hyper/blob/master/examples/client.rs"
         .parse::<hyper::Uri>()
         .unwrap();
     let host = url.host().expect("uri has no host");
@@ -64,8 +64,8 @@ async fn hyper_app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let authority = url.authority().unwrap().clone();
 
     let req = Request::builder()
-        .uri(url)
-        .header(hyper::header::HOST, authority.as_str())
+        .header("Host", "example.com")
+        .method("GET")
         .body(String::new())
         .unwrap();
 

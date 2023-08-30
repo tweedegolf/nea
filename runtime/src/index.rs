@@ -143,7 +143,7 @@ pub enum IoIndex {
 impl IoIndex {
     pub(crate) fn from_index(resources: IoResources, queue_index: QueueIndex) -> Self {
         let index = queue_index.index as usize;
-        let total_per_bucket = resources.tcp_streams + resources.http_connections;
+        let total_per_bucket = resources.per_bucket();
 
         let tcp_stream_range = 1..resources.tcp_streams;
         let http_connection_range =

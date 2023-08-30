@@ -55,17 +55,88 @@ pub struct Executor<F: 'static> {
     inner: &'static Inner<F>,
 }
 
-type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
+// type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
 type Http2Connection =
-    hyper::client::conn::http2::Connection<reactor::TcpStream, String, Executor<()>>;
+    hyper::client::conn::http2::Connection<reactor::TcpStream, String, HyperExecutor>;
 
 type PinBoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+#[repr(transparent)]
+#[derive(Debug)]
+struct Identifier(AtomicU32);
+
+impl Identifier {
+    const EMPTY_U32: u32 = u32::MAX;
+    const EMPTY: Self = Self(AtomicU32::new(Self::EMPTY_U32));
+
+    const RESERVED_U32: u32 = Self::EMPTY_U32 - 1;
+    const RESERVED: Self = Self(AtomicU32::new(Self::EMPTY_U32));
+
+    fn next(&self) {
+        let value = self.0.load(Ordering::Acquire);
+
+        if value == Self::EMPTY_U32 {
+            panic!("cannot increment Self::EMPTY");
+        }
+
+        // wrap around
+        let new_value = if value == Self::RESERVED_U32 - 1 {
+            0
+        } else {
+            value + 1
+        };
+
+        self.0.store(new_value, Ordering::Release);
+    }
+
+    fn try_reserve(&self) -> Result<(), ()> {
+        match self.0.compare_exchange(
+            Self::EMPTY_U32,
+            Self::RESERVED_U32,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn claim(&self, identifier: u32) {
+        match self.0.compare_exchange(
+            Self::RESERVED_U32,
+            identifier,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {}
+            Err(_) => {
+                panic!("claiming a bucket that was not reserved!");
+            }
+        }
+    }
+
+    fn free(&self) {
+        let old = self.0.swap(Self::EMPTY_U32, Ordering::Relaxed);
+
+        assert_ne!(
+            old,
+            Self::EMPTY_U32,
+            "to remove a future it must be present"
+        );
+
+        assert_ne!(
+            old,
+            Self::RESERVED_U32,
+            "to remove a future it must be present"
+        );
+    }
+}
+
 struct Inner<F> {
     io_resources: IoResources,
-    filled: Mutex<Box<[bool]>>,
+    filled: Mutex<Box<[Identifier]>>,
     futures: Box<[Mutex<Option<Task<F>>>]>,
-    connections: Box<[Mutex<Slot<Http1Connection>>]>,
+    connections: Box<[Mutex<Slot<Http2Connection>>]>,
     http2_futures: Box<[Mutex<Slot<PinBoxFuture>>]>,
     queue: SimpleQueue<QueueIndex>,
     identifier: AtomicU32,
@@ -88,17 +159,19 @@ struct Task<F> {
 
 static INNER: OnceLock<&()> = OnceLock::new();
 
-impl<F, T> hyper::rt::Executor<F> for Executor<T>
+#[derive(Clone, Copy)]
+struct HyperExecutor {
+    bucket_index: BucketIndex,
+}
+
+impl<F> hyper::rt::Executor<F> for HyperExecutor
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
-        // TODO get from a thread-local
-        let bucket_index = BucketIndex {
-            index: 0,
-            identifier: 0,
-        };
+        // NOTE: the unit here is a lie! we just don't know the correct type for the future here
+        let executor = Executor::<()>::get().unwrap();
 
         // make a future that just always returns unit
         let future = async move {
@@ -107,10 +180,10 @@ where
 
         let pinned = Box::pin(future);
 
-        let indices = self.inner.io_resources.http2_futures(bucket_index);
+        let indices = executor.inner.io_resources.http2_futures(self.bucket_index);
         let http2_future_start_index = indices.start;
 
-        let lock = self.inner.http2_futures[indices]
+        let lock = executor.inner.http2_futures[indices]
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| Some((i, slot.try_lock().ok()?)))
@@ -126,14 +199,14 @@ where
         *slot = Slot::Occupied(pinned);
 
         let http2_future_index = Http2FutureIndex {
-            identifier: bucket_index.identifier,
+            identifier: self.bucket_index.identifier,
             index: (http2_future_start_index + i) as u32,
         };
 
         let queue_index =
-            QueueIndex::from_http2_future_index(self.inner.io_resources, http2_future_index);
+            QueueIndex::from_http2_future_index(executor.inner.io_resources, http2_future_index);
 
-        if self.inner.queue.enqueue(queue_index).is_err() {
+        if executor.inner.queue.enqueue(queue_index).is_err() {
             log::warn!("connection cannot be started because the queue is full! ");
         }
     }
@@ -153,7 +226,7 @@ impl<F> Executor<F> {
         bucket_index: BucketIndex,
         host: &str,
         port: u16,
-    ) -> std::io::Result<hyper::client::conn::http1::SendRequest<String>> {
+    ) -> std::io::Result<hyper::client::conn::http2::SendRequest<String>> {
         let stream = std::net::TcpStream::connect(format!("{}:{}", host, port)).unwrap();
         stream.set_nonblocking(true)?;
 
@@ -191,7 +264,11 @@ impl<F> Executor<F> {
             QueueIndex::from_connection_index(self.inner.io_resources, connection_index);
         let stream = reactor.register(queue_index, stream).unwrap();
 
-        let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+        // let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+        let hyper_executor = HyperExecutor { bucket_index };
+        let (sender, conn) = hyper::client::conn::http2::handshake(hyper_executor, stream)
+            .await
+            .unwrap();
 
         *self.inner.connections[connection_index.index as usize]
             .try_lock()
@@ -218,11 +295,16 @@ where
     pub fn get_or_init(bucket_count: usize, io_resources: IoResources) -> Self {
         match INNER.get() {
             None => {
+                let filled = Mutex::new(
+                    std::iter::repeat_with(|| Identifier::EMPTY)
+                        .take(bucket_count)
+                        .collect(),
+                );
+
                 let queue_capacity = bucket_count * io_resources.per_bucket();
                 let futures = std::iter::repeat_with(|| Mutex::new(None))
                     .take(queue_capacity)
                     .collect();
-                let filled = Mutex::new(std::iter::repeat(false).take(bucket_count).collect());
 
                 let connection_count = bucket_count * io_resources.http_connections;
                 let connections = std::iter::repeat_with(|| Mutex::new(Slot::Empty))
@@ -337,7 +419,8 @@ where
         loop {
             let queue_index = self.queue.blocking_dequeue();
 
-            match IoIndex::from_index(self.io_resources, queue_index) {
+            dbg!(queue_index.index);
+            match dbg!(IoIndex::from_index(self.io_resources, queue_index)) {
                 IoIndex::InputStream(bucket_index) => {
                     let mut task_mut = self.futures[bucket_index.index as usize].lock().unwrap();
 
@@ -384,7 +467,7 @@ where
 
                     match pinned.poll(&mut cx) {
                         std::task::Poll::Ready(_) => {
-                            // drop(task_mut);
+                            *task_mut = Slot::Empty;
                         }
                         std::task::Poll::Pending => {
                             // keep the future in the slab
@@ -407,7 +490,7 @@ where
 
                     match connection.as_mut().poll(&mut cx) {
                         std::task::Poll::Ready(_) => {
-                            // drop(task_mut);
+                            *task_mut = Slot::Empty;
                         }
                         std::task::Poll::Pending => {
                             // keep the future in the slab
@@ -420,13 +503,12 @@ where
 
     fn try_claim(&self) -> Option<BucketIndex> {
         let mut guard = self.filled.lock().unwrap();
-        let index = guard.iter().position(|filled| !filled)?;
-
-        guard[index] = true;
+        let index = guard.iter().position(|id| id.try_reserve().is_ok())?;
 
         let identifier = self.identifier.fetch_add(1, Ordering::Relaxed);
-        let index = index as u32;
+        guard[index].claim(identifier);
 
+        let index = index as u32;
         Some(BucketIndex { identifier, index })
     }
 
@@ -439,7 +521,7 @@ where
     }
 
     fn remove(&self, index: BucketIndex) {
-        let mut guard = self.filled.lock().unwrap();
+        let guard = self.filled.lock().unwrap();
 
         loop {
             match self.futures[index.index as usize].lock().unwrap().take() {
@@ -460,10 +542,14 @@ where
             *slot = Slot::Empty;
         }
 
-        let mut set = false;
-        std::mem::swap(&mut guard[index.index as usize], &mut set);
+        for slot in self.http2_futures[self.io_resources.http2_futures(index)].iter() {
+            let mut slot = slot.try_lock().unwrap();
 
-        assert!(set, "to remove a future it must be present");
+            // will drop/clean up the TCP connection
+            *slot = Slot::Empty;
+        }
+
+        guard[index.index as usize].free();
     }
 }
 
