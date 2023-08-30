@@ -34,7 +34,7 @@ where
 
         let addr = format!("{}:{}", config.host, config.port);
         let listener = net::TcpListener::bind(&addr)?;
-        info!("listening on http://{}", addr);
+        println!("listening on http://{}", addr);
 
         // accept connections and process them serially
         for (i, stream) in listener.incoming().enumerate() {
