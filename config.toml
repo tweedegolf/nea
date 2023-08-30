@@ -1,7 +1,7 @@
 host = "127.0.0.1"
 port = 8080
 
-bucket_count = 1
+bucket_count = 4
 
 [io_resources]
 # usually 2: the input stream and a socket for database IO

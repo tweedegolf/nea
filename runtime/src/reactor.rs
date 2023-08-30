@@ -323,8 +323,6 @@ impl hyper::rt::Read for TcpStream {
 
         buf_mut[..n].copy_from_slice(&tmp_buf[..n]);
 
-        dbg!("read", n);
-
         unsafe {
             buf.advance(n);
         }
