@@ -1,31 +1,55 @@
 use crate::IoResources;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionIndex {
     pub identifier: u32,
     pub index: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Http2FutureIndex {
     pub identifier: u32,
     pub index: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BucketIndex {
     pub identifier: u32,
     pub index: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct QueueIndex {
     pub identifier: u32,
     pub index: u32,
+}
+
+impl std::fmt::Debug for Http2FutureIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("Http2FutureIndex {{ index: {} }}", self.index))
+    }
+}
+
+impl std::fmt::Debug for ConnectionIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("ConnectionIndex {{ index: {} }}", self.index))
+    }
+}
+
+impl std::fmt::Debug for BucketIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("BucketIndex {{ index: {} }}", self.index))
+    }
+}
+
+impl std::fmt::Debug for QueueIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("QueueIndex {{ index: {} }}", self.index))
+    }
 }
 
 impl QueueIndex {

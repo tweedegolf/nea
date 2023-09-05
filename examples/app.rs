@@ -4,13 +4,13 @@ use std::io::{Cursor, Write};
 use runtime::{reactor, BucketIndex, Nea};
 
 fn main() {
-    if let Err(error) = Nea::new(hyper_app).run() {
+    if let Err(error) = Nea::new(app).run() {
         eprintln!("{error}");
     }
 }
 
 #[allow(unused)]
-async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
+async fn app(_bucket_index: BucketIndex, tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
 
@@ -35,17 +35,15 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
 }
 
 #[allow(unused)]
-async fn hyper_app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
+async fn hyper_app(
+    bucket_index: BucketIndex,
+    tcp_stream: reactor::TcpStream,
+) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
 
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
-
-    let index = BucketIndex {
-        identifier: 0,
-        index: 0,
-    };
 
     let url = "https://github.com/hyperium/hyper/blob/master/examples/client.rs"
         .parse::<hyper::Uri>()
@@ -55,11 +53,11 @@ async fn hyper_app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
 
     let mut sender = runtime::Executor::<()>::get()
         .unwrap()
-        .handshake(index, host, port)
+        .handshake(bucket_index, host, port)
         .await
         .unwrap();
 
-    log::info!("performed handshake {} {}", index.index, index.identifier);
+    log::info!("performed handshake {}", bucket_index.index);
 
     let authority = url.authority().unwrap().clone();
 
