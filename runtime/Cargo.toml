@@ -19,3 +19,4 @@ slab = "0.4.8"
 toml = "0.7.6"
 
 shared = { path = "../shared" }
+atomic-wait = "1.1.0"

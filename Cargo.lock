@@ -447,6 +447,7 @@ version = "0.1.0"
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "atomic-wait",
  "env_logger",
  "hyper",
  "log",
