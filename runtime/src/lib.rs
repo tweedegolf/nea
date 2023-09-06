@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
-    task::{Context, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 mod config;
@@ -422,14 +422,53 @@ where
 
                 let done_with_item = match io_index {
                     IoIndex::InputStream(bucket_index) => {
-                        self.run_input_stream(queue_index, bucket_index)
+                        let poll = self.poll_input_stream(queue_index, bucket_index);
+
+                        match poll {
+                            Poll::Ready(()) => {
+                                let new_rc =
+                                    self.decref(queue_index.to_bucket_index(self.io_resources));
+
+                                if new_rc != 0 {
+                                    self.queue.done_with_item(queue_index)
+                                } else {
+                                    DoneWithItem::Done
+                                }
+                            }
+                            Poll::Pending => {
+                                // keep the future in the slab
+                                self.queue.done_with_item(queue_index)
+                            }
+                        }
                     }
                     IoIndex::CustomStream(_) => todo!(),
                     IoIndex::HttpConnection(connection_index) => {
-                        self.run_http_connection(queue_index, connection_index)
+                        let poll = self.poll_http_connection(queue_index, connection_index);
+
+                        match poll {
+                            Poll::Ready(_) => self.queue.done_with_item(queue_index),
+                            Poll::Pending => self.queue.done_with_item(queue_index),
+                        }
                     }
                     IoIndex::Http2Future(future_index) => {
-                        self.run_http2_future(queue_index, future_index)
+                        let poll = self.poll_http2_future(queue_index, future_index);
+
+                        match poll {
+                            Poll::Ready(()) => {
+                                let new_rc =
+                                    self.decref(queue_index.to_bucket_index(self.io_resources));
+
+                                if new_rc != 0 {
+                                    self.queue.done_with_item(queue_index)
+                                } else {
+                                    DoneWithItem::Done
+                                }
+                            }
+                            Poll::Pending => {
+                                // keep the future in the slab
+                                self.queue.done_with_item(queue_index)
+                            }
+                        }
                     }
                 };
 
@@ -442,7 +481,7 @@ where
         }
     }
 
-    fn run_input_stream(&self, queue_index: QueueIndex, bucket_index: BucketIndex) -> DoneWithItem {
+    fn poll_input_stream(&self, queue_index: QueueIndex, bucket_index: BucketIndex) -> Poll<()> {
         let mut task_mut = self.futures[bucket_index.index as usize].lock().unwrap();
 
         let task = match task_mut.as_mut() {
@@ -461,26 +500,17 @@ where
             std::task::Poll::Ready(_) => {
                 drop(task_mut);
 
-                let new_rc = self.decref(queue_index.to_bucket_index(self.io_resources));
-
-                if new_rc != 0 {
-                    self.queue.done_with_item(queue_index)
-                } else {
-                    DoneWithItem::Done
-                }
+                Poll::Ready(())
             }
-            std::task::Poll::Pending => {
-                // keep the future in the slab
-                self.queue.done_with_item(queue_index)
-            }
+            std::task::Poll::Pending => Poll::Pending,
         }
     }
 
-    fn run_http_connection(
+    fn poll_http_connection(
         &self,
         queue_index: QueueIndex,
         connection_index: ConnectionIndex,
-    ) -> DoneWithItem {
+    ) -> Poll<()> {
         let mut task_mut = self.connections[connection_index.index as usize]
             .lock()
             .unwrap();
@@ -497,25 +527,25 @@ where
         let mut cx = Context::from_waker(&waker);
 
         match pinned.poll(&mut cx) {
-            std::task::Poll::Ready(_) => {
+            std::task::Poll::Ready(result) => {
                 *task_mut = Slot::Empty;
                 drop(task_mut);
 
-                // self.decref(queue_index.to_bucket_index(self.io_resources));
-                self.queue.done_with_item(queue_index)
+                if let Err(e) = result {
+                    log::warn!("error in http connection {e:?}");
+                }
+
+                Poll::Ready(())
             }
-            std::task::Poll::Pending => {
-                // keep the future in the slab
-                self.queue.done_with_item(queue_index)
-            }
+            std::task::Poll::Pending => Poll::Pending,
         }
     }
 
-    fn run_http2_future(
+    fn poll_http2_future(
         &self,
         queue_index: QueueIndex,
         future_index: Http2FutureIndex,
-    ) -> DoneWithItem {
+    ) -> Poll<()> {
         let mut task_mut = self.http2_futures[future_index.index as usize]
             .lock()
             .unwrap();
@@ -523,7 +553,7 @@ where
         let connection = match task_mut.deref_mut() {
             Slot::Empty | Slot::Reserved => {
                 log::warn!("http2 future in the queue, but there is no future");
-                return DoneWithItem::Done;
+                return Poll::Ready(());
             }
             Slot::Occupied(inner) => inner,
         };
@@ -535,21 +565,11 @@ where
         match connection.as_mut().poll(&mut cx) {
             std::task::Poll::Ready(_) => {
                 *task_mut = Slot::Empty;
-
                 drop(task_mut);
 
-                let new_rc = self.decref(queue_index.to_bucket_index(self.io_resources));
-
-                if new_rc != 0 {
-                    self.queue.done_with_item(queue_index)
-                } else {
-                    DoneWithItem::Done
-                }
+                Poll::Ready(())
             }
-            std::task::Poll::Pending => {
-                // keep the future in the slab
-                self.queue.done_with_item(queue_index)
-            }
+            std::task::Poll::Pending => Poll::Pending,
         }
     }
 
