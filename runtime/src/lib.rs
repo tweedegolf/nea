@@ -437,34 +437,29 @@ where
                     }
                 };
 
-                if is_reference_counted {
+                let action = if is_reference_counted {
                     match poll {
                         Poll::Ready(()) => {
                             let new_rc =
                                 self.decref(queue_index.to_bucket_index(self.io_resources));
 
-                            if new_rc != 0 {
-                                match self.queue.done_with_item(queue_index) {
-                                    DoneWithItem::Done => break,
-                                    DoneWithItem::GoAgain => continue,
-                                }
-                            } else {
-                                break;
+                            match new_rc {
+                                0 => break,
+                                _ => self.queue.done_with_item(queue_index),
                             }
                         }
                         Poll::Pending => {
                             // keep the future in the slab
-                            match self.queue.done_with_item(queue_index) {
-                                DoneWithItem::Done => break,
-                                DoneWithItem::GoAgain => continue,
-                            }
+                            self.queue.done_with_item(queue_index)
                         }
                     }
                 } else {
-                    match self.queue.done_with_item(queue_index) {
-                        DoneWithItem::Done => break,
-                        DoneWithItem::GoAgain => continue,
-                    }
+                    self.queue.done_with_item(queue_index)
+                };
+
+                match action {
+                    DoneWithItem::Done => break,
+                    DoneWithItem::GoAgain => continue,
                 }
             }
         }
