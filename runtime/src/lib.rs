@@ -420,62 +420,51 @@ where
             loop {
                 let io_index = IoIndex::from_index(self.io_resources, queue_index);
 
-                let done_with_item = match io_index {
+                let is_reference_counted;
+                let poll = match io_index {
                     IoIndex::InputStream(bucket_index) => {
-                        let poll = self.poll_input_stream(queue_index, bucket_index);
-
-                        match poll {
-                            Poll::Ready(()) => {
-                                let new_rc =
-                                    self.decref(queue_index.to_bucket_index(self.io_resources));
-
-                                if new_rc != 0 {
-                                    self.queue.done_with_item(queue_index)
-                                } else {
-                                    DoneWithItem::Done
-                                }
-                            }
-                            Poll::Pending => {
-                                // keep the future in the slab
-                                self.queue.done_with_item(queue_index)
-                            }
-                        }
+                        is_reference_counted = true;
+                        self.poll_input_stream(queue_index, bucket_index)
                     }
                     IoIndex::CustomStream(_) => todo!(),
                     IoIndex::HttpConnection(connection_index) => {
-                        let poll = self.poll_http_connection(queue_index, connection_index);
-
-                        match poll {
-                            Poll::Ready(_) => self.queue.done_with_item(queue_index),
-                            Poll::Pending => self.queue.done_with_item(queue_index),
-                        }
+                        is_reference_counted = false;
+                        self.poll_http_connection(queue_index, connection_index)
                     }
                     IoIndex::Http2Future(future_index) => {
-                        let poll = self.poll_http2_future(queue_index, future_index);
-
-                        match poll {
-                            Poll::Ready(()) => {
-                                let new_rc =
-                                    self.decref(queue_index.to_bucket_index(self.io_resources));
-
-                                if new_rc != 0 {
-                                    self.queue.done_with_item(queue_index)
-                                } else {
-                                    DoneWithItem::Done
-                                }
-                            }
-                            Poll::Pending => {
-                                // keep the future in the slab
-                                self.queue.done_with_item(queue_index)
-                            }
-                        }
+                        is_reference_counted = true;
+                        self.poll_http2_future(queue_index, future_index)
                     }
                 };
 
-                // the queue index may have been enqueued again while we processed it.
-                match done_with_item {
-                    DoneWithItem::Done => break,
-                    DoneWithItem::GoAgain => continue,
+                if is_reference_counted {
+                    match poll {
+                        Poll::Ready(()) => {
+                            let new_rc =
+                                self.decref(queue_index.to_bucket_index(self.io_resources));
+
+                            if new_rc != 0 {
+                                match self.queue.done_with_item(queue_index) {
+                                    DoneWithItem::Done => break,
+                                    DoneWithItem::GoAgain => continue,
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        Poll::Pending => {
+                            // keep the future in the slab
+                            match self.queue.done_with_item(queue_index) {
+                                DoneWithItem::Done => break,
+                                DoneWithItem::GoAgain => continue,
+                            }
+                        }
+                    }
+                } else {
+                    match self.queue.done_with_item(queue_index) {
+                        DoneWithItem::Done => break,
+                        DoneWithItem::GoAgain => continue,
+                    }
                 }
             }
         }
