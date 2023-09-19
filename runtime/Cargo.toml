@@ -10,7 +10,7 @@ name = "app"
 path = "../examples/app.rs"
 
 [dependencies]
-hyper = { version = "1.0.0-rc.4", features = ["client", "http1"] }
+hyper = { version = "1.0.0-rc.4", features = ["client", "http1", "http2"] }
 log = "0.4.20"
 env_logger = "0.10.0"
 mio = { version = "0.8.8", features = ["os-poll", "net"] }
@@ -19,3 +19,4 @@ slab = "0.4.8"
 toml = "0.7.6"
 
 shared = { path = "../shared" }
+atomic-wait = "1.1.0"

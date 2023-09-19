@@ -10,7 +10,7 @@ fn main() {
 }
 
 #[allow(unused)]
-async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
+async fn app(_bucket_index: BucketIndex, tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
 
@@ -35,19 +35,17 @@ async fn app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
 }
 
 #[allow(unused)]
-async fn hyper_app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
+async fn hyper_app(
+    bucket_index: BucketIndex,
+    tcp_stream: reactor::TcpStream,
+) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = tcp_stream.read(&mut buffer).await?;
 
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
 
-    let index = BucketIndex {
-        identifier: 0,
-        index: 0,
-    };
-
-    let url = "http://docs.rs/h2/latest/h2/"
+    let url = "https://github.com/hyperium/hyper/blob/master/examples/client.rs"
         .parse::<hyper::Uri>()
         .unwrap();
     let host = url.host().expect("uri has no host");
@@ -55,17 +53,17 @@ async fn hyper_app(tcp_stream: reactor::TcpStream) -> std::io::Result<()> {
 
     let mut sender = runtime::Executor::<()>::get()
         .unwrap()
-        .handshake(index, host, port)
+        .handshake(bucket_index, host, port)
         .await
         .unwrap();
 
-    log::info!("performed handshake {} {}", index.index, index.identifier);
+    log::info!("performed handshake {}", bucket_index.index);
 
     let authority = url.authority().unwrap().clone();
 
     let req = Request::builder()
-        .uri(url)
-        .header(hyper::header::HOST, authority.as_str())
+        .header("Host", "example.com")
+        .method("GET")
         .body(String::new())
         .unwrap();
 

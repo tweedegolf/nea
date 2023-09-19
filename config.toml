@@ -1,10 +1,12 @@
 host = "127.0.0.1"
 port = 8080
 
-bucket_count = 4
+bucket_count = 8
 
 [io_resources]
 # usually 2: the input stream and a socket for database IO
 tcp_streams = 2
 # number of concurrent requests that a handler can perform. Exceeding this limit will cancel the handler and return an error status code
-http_connections = 8
+http_connections = 1
+# http2 needs to keep connections alive. that requires extra futures.
+http2_futures = 2
