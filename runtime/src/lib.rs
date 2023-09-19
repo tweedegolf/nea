@@ -440,12 +440,24 @@ where
                 let action = if is_reference_counted {
                     match poll {
                         Poll::Ready(()) => {
-                            let new_rc =
-                                self.decref(queue_index.to_bucket_index(self.io_resources));
+                            let bucket_index = queue_index.to_bucket_index(self.io_resources);
+                            let current_refcount = self.getref(bucket_index);
 
-                            match new_rc {
-                                0 => break,
-                                _ => self.queue.done_with_item(queue_index),
+                            match current_refcount {
+                                1 => {
+                                    assert_eq!(self.decref(bucket_index), 0);
+                                    break;
+                                }
+                                _ => match self.queue.done_with_item(queue_index) {
+                                    DoneWithItem::Done => {
+                                        self.decref(bucket_index);
+                                        break;
+                                    }
+                                    DoneWithItem::GoAgain => {
+                                        // do NOT decrement the refcount
+                                        continue;
+                                    }
+                                },
                             }
                         }
                         Poll::Pending => {
@@ -579,9 +591,12 @@ where
         debug_assert!(old.is_none());
     }
 
+    fn getref(&self, index: BucketIndex) -> u32 {
+        (self.refcounts[index.index as usize].0).load(Ordering::Relaxed)
+    }
+
     fn decref(&self, index: BucketIndex) -> u32 {
-        let guard = &self.refcounts;
-        let refcount = &guard[index.index as usize].0;
+        let refcount = &self.refcounts[index.index as usize].0;
 
         // value was one, so after subtracting 1, it will be zero, and we can free this slot
         let old = refcount.fetch_sub(1, Ordering::Relaxed);
@@ -632,8 +647,8 @@ where
     }
 }
 
-const ENQUEUED_BIT: u8 = 1;
-const IN_PROGRESS_BIT: u8 = 1 << 1;
+const ENQUEUED_BIT: u8 = 0b0001;
+const IN_PROGRESS_BIT: u8 = 0b0010;
 
 struct ComplexQueue {
     queue: Box<[AtomicU8]>,
@@ -662,18 +677,21 @@ impl ComplexQueue {
     }
 
     fn increment_active(&self) {
-        let _ = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+        let old = self.active.fetch_add(1, Ordering::Relaxed);
+
+        if let None = old.checked_add(1) {
+            panic!("RC does not overflow");
+        }
+
         atomic_wait::wake_one(&self.active);
     }
 
     fn decrement_active(&self) {
-        // let _ = self.active.fetch_sub(1, Ordering::Relaxed) - 1;
-        //
-        let _ = self
-            .active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
-            });
+        let old = self.active.fetch_sub(1, Ordering::Relaxed);
+
+        if let None = old.checked_sub(1) {
+            panic!("RC does not underflow");
+        }
     }
 
     fn wait_active(&self) {
@@ -685,16 +703,16 @@ impl ComplexQueue {
     fn enqueue(&self, index: QueueIndex) -> Result<(), QueueIndex> {
         let current = &self.queue[index.index as usize];
 
-        let mut new_active = false;
+        let mut already_in_queue = false;
 
         let added = current.fetch_update(Ordering::Acquire, Ordering::Relaxed, |value| {
             // if the slot is already in progress, don't increment the active count
-            new_active = value & IN_PROGRESS_BIT == 0;
+            already_in_queue = value & ENQUEUED_BIT != 0;
 
             Some(value | ENQUEUED_BIT)
         });
 
-        if new_active {
+        if !already_in_queue {
             self.increment_active();
         }
 
@@ -715,6 +733,7 @@ impl ComplexQueue {
             debug_assert!(value & IN_PROGRESS_BIT != 0);
 
             if value & ENQUEUED_BIT != 0 {
+                self.decrement_active();
                 // this slot got enqueued while we were processing it
                 // slot must be processed again
                 done_with_item = DoneWithItem::GoAgain;
@@ -735,6 +754,7 @@ impl ComplexQueue {
         let it = first.iter().chain(later).enumerate();
 
         for (i, value) in it {
+            // find a task that is enqueued but not yet in progress
             let r = value.compare_exchange(
                 ENQUEUED_BIT,
                 IN_PROGRESS_BIT,
