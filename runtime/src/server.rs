@@ -22,7 +22,7 @@ where
     }
 
     pub fn run(self) -> io::Result<()> {
-        env_logger::init();
+        log::init();
 
         let config = Config::load();
 
