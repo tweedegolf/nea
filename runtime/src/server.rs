@@ -1,4 +1,3 @@
-use log::{info, warn};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
@@ -34,7 +33,10 @@ where
 
         let addr = format!("{}:{}", config.host, config.port);
         let listener = net::TcpListener::bind(&addr)?;
-        println!("listening on http://{}", addr);
+        let id = std::thread::current().id();
+        println!("listening on http://{addr} on thread {id:?}");
+
+        crate::IS_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // accept connections and process them serially
         for (i, stream) in listener.incoming().enumerate() {
@@ -45,30 +47,32 @@ where
             match executor.try_claim() {
                 None => {
                     // no space in the queue
-                    warn!("main: no space in the queue");
+                    log::warn!("main: no space in the queue");
                     stream.shutdown(net::Shutdown::Both).unwrap();
                 }
-                Some(bucket_index) => executor.execute(bucket_index, async move {
-                    info!(
-                        "new connection {i} (index = {}, fd = {fd})",
-                        bucket_index.index
-                    );
+                Some(bucket_index) => {
+                    executor.execute(bucket_index, async move {
+                        log::info!(
+                            "new connection {i} (index = {}, fd = {fd})",
+                            bucket_index.index
+                        );
 
-                    let queue_index =
-                        QueueIndex::from_bucket_index(config.io_resources, bucket_index);
-                    let tcp_stream = reactor.register(queue_index, stream).unwrap();
+                        let queue_index =
+                            QueueIndex::from_bucket_index(config.io_resources, bucket_index);
+                        let tcp_stream = reactor.register(queue_index, stream).unwrap();
 
-                    match (self.handler)(bucket_index, tcp_stream).await {
-                        Ok(()) => {}
-                        Err(e) => match e.kind() {
-                            ErrorKind::NotConnected => {}
-                            _ => Err(e).unwrap(),
-                        },
-                    }
-                }),
+                        match (self.handler)(bucket_index, tcp_stream).await {
+                            Ok(()) => {}
+                            Err(e) => match e.kind() {
+                                ErrorKind::NotConnected => {}
+                                _ => Err(e).unwrap(),
+                            },
+                        }
+                    });
+                }
             };
 
-            info!("main spawned future for connection {i}");
+            log::info!("main spawned future for connection {i}");
         }
 
         Ok(())

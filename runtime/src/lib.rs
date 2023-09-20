@@ -8,7 +8,7 @@ use std::{
     ops::{DerefMut, Range},
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -215,7 +215,6 @@ impl<F> Executor<F> {
         host: &str,
         port: u16,
     ) -> std::io::Result<hyper::client::conn::http2::SendRequest<String>> {
-        println!("handshake for bucket {}", bucket_index.index);
         let stream = std::net::TcpStream::connect(format!("{}:{}", host, port)).unwrap();
         stream.set_nonblocking(true)?;
 
@@ -288,6 +287,8 @@ where
     }
 
     pub fn get_or_init(bucket_count: usize, io_resources: IoResources) -> Self {
+        ARENA_INDEX.with(|a| a.store(ARENA_INDEX_EXECUTOR, Ordering::Relaxed));
+
         match INNER.get() {
             None => {
                 let refcounts = std::iter::repeat_with(|| Refcount::EMPTY)
@@ -409,6 +410,114 @@ impl Default for IoResources {
     }
 }
 
+const ARENA_INDEX_BEFORE_MAIN: u32 = u32::MAX;
+const ARENA_INDEX_EXECUTOR: u32 = u32::MAX - 1;
+pub(crate) const ARENA_INDEX_REACTOR: u32 = u32::MAX - 2;
+const ARENA_INDEX_UNINITIALIZED: u32 = u32::MAX - 3;
+
+pub(crate) static IS_RUNNING: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    pub(crate) static ARENA_INDEX: AtomicU32 = AtomicU32::new(ARENA_INDEX_BEFORE_MAIN);
+}
+
+pub struct NeaAllocator(shared::allocator::ServerAlloc);
+
+impl NeaAllocator {
+    pub const fn new() -> Self {
+        Self(shared::allocator::ServerAlloc::new())
+    }
+
+    pub fn initialize_buckets(
+        &self,
+        number_of_buckets: usize,
+        bucket_size: usize,
+    ) -> std::io::Result<()> {
+        self.0.initialize_buckets(number_of_buckets, bucket_size)
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for NeaAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _size = layout.size();
+
+        match ARENA_INDEX.with(|v| v.load(Ordering::Relaxed)) {
+            self::ARENA_INDEX_BEFORE_MAIN => {
+                let bucket_name = "∞";
+
+                // NOTE: this piece of code runs before main, so before the logger is setup
+                // hence we cannot use `log::*` here!
+                eprintln!("bucket {bucket_name}: allocating {_size} bytes",);
+
+                match self.0.try_allocate_in_initial_bucket(layout) {
+                    None => std::ptr::null_mut(), // a panic would be UB!
+                    Some(non_null) => non_null.as_ptr(),
+                }
+            }
+            index @ (self::ARENA_INDEX_EXECUTOR | self::ARENA_INDEX_REACTOR) => {
+                let bucket_name = match index {
+                    self::ARENA_INDEX_BEFORE_MAIN => "∞",
+                    self::ARENA_INDEX_EXECUTOR => "executor",
+                    self::ARENA_INDEX_REACTOR => "reactor",
+                    _ => unreachable!(),
+                };
+
+                let id = std::thread::current().id();
+
+                // NOTE: this piece of code runs before main, so before the logger is setup
+                // hence we cannot use `log::*` here!
+                eprintln!("thread {id:?}: bucket {bucket_name}: allocating {_size} bytes",);
+
+                match self.0.try_allocate_in_initial_bucket(layout) {
+                    None => std::ptr::null_mut(), // a panic would be UB!
+                    Some(non_null) => non_null.as_ptr(),
+                }
+            }
+            bucket_index => {
+                log::trace!("bucket {bucket_index}: allocating {_size} bytes",);
+
+                let msg = b"out of memory\0";
+                let panic_tag = 1;
+
+                match self.0.try_allocate_in_bucket(layout, bucket_index as usize) {
+                    // None => roc_panic(msg.map(|x| x as std::ffi::c_char).as_ptr(), panic_tag),
+                    None => panic!("out of memory"),
+                    Some(non_null) => non_null.as_ptr(),
+                }
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: std::alloc::Layout) {
+        /* do nothing */
+    }
+}
+
+pub struct LoggingAllocator(pub std::alloc::System);
+
+unsafe impl std::alloc::GlobalAlloc for LoggingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let arena = ARENA_INDEX.with(|a| a.load(Ordering::Relaxed));
+        let w = layout.size();
+
+        if arena == ARENA_INDEX_EXECUTOR {
+            eprintln!("allocating {w} bytes in arena ARENA_INDEX_EXECUTOR");
+        } else if arena == ARENA_INDEX_REACTOR {
+            eprintln!("allocating {w} bytes in ARENA_INDEX_REACTOR");
+        } else if arena == ARENA_INDEX_UNINITIALIZED {
+            eprintln!("allocating {w} bytes in ARENA_INDEX_UNINITIALIZED");
+        } else {
+            eprintln!("allocating {w} bytes in arena {arena}");
+        }
+
+        self.0.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        self.0.dealloc(ptr, layout)
+    }
+}
+
 impl<F> Inner<F>
 where
     F: Future<Output = ()> + Send,
@@ -417,9 +526,21 @@ where
         loop {
             let queue_index = self.queue.blocking_dequeue();
 
-            loop {
-                let io_index = IoIndex::from_index(self.io_resources, queue_index);
+            // configure the
+            {
+                let bucket_index = queue_index.to_bucket_index(self.io_resources);
+                ARENA_INDEX.with(|a| a.store(bucket_index.index, Ordering::Relaxed));
 
+                log::trace!("arena index is now {}", bucket_index.index);
+            }
+
+            let mut free_arena = false;
+
+            let io_index = IoIndex::from_index(self.io_resources, queue_index);
+
+            // if this job get enqueue'd again while we're processing it, we just continue
+            // processing it on this worker thread.
+            'current_job: loop {
                 let is_reference_counted;
                 let poll = match io_index {
                     IoIndex::InputStream(bucket_index) => {
@@ -446,16 +567,20 @@ where
                             match current_refcount {
                                 1 => {
                                     assert_eq!(self.decref(bucket_index), 0);
-                                    break;
+
+                                    // we're done with this arena now, it can be free'd
+                                    free_arena = true;
+
+                                    break 'current_job;
                                 }
                                 _ => match self.queue.done_with_item(queue_index) {
                                     DoneWithItem::Done => {
                                         self.decref(bucket_index);
-                                        break;
+                                        break 'current_job;
                                     }
                                     DoneWithItem::GoAgain => {
                                         // do NOT decrement the refcount
-                                        continue;
+                                        continue 'current_job;
                                     }
                                 },
                             }
@@ -473,6 +598,14 @@ where
                     DoneWithItem::Done => break,
                     DoneWithItem::GoAgain => continue,
                 }
+            }
+
+            if free_arena {
+                eprintln!("TODO free the arena");
+            }
+
+            {
+                ARENA_INDEX.with(|a| a.store(ARENA_INDEX_UNINITIALIZED, Ordering::Relaxed));
             }
         }
     }
