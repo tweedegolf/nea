@@ -1,10 +1,12 @@
 use hyper::Request;
 use std::io::{Cursor, Write};
 
-use runtime::{reactor, BucketIndex, Nea};
+use runtime::{reactor, BucketIndex, Nea, NeaAllocator};
 
 fn main() {
-    if let Err(error) = Nea::new(app).run() {
+    ALLOCATOR.initialize_buckets(5, 64 * 4096).unwrap();
+
+    if let Err(error) = Nea::new(hyper_app).run() {
         eprintln!("{error}");
     }
 }
@@ -93,17 +95,23 @@ async fn hyper_app(
 }
 
 #[global_allocator]
-static ALLOCATOR: LogSystem = LogSystem(std::alloc::System);
+static ALLOCATOR: NeaAllocator = NeaAllocator::new();
 
-struct LogSystem(std::alloc::System);
+// #[global_allocator]
+// static ALLOCATOR: LoggingAllocator = LoggingAllocator(std::alloc::System);
 
-unsafe impl std::alloc::GlobalAlloc for LogSystem {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        // eprintln!("allocating {} bytes", layout.size());
-        self.0.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        self.0.dealloc(ptr, layout)
-    }
-}
+// #[global_allocator]
+// static ALLOCATOR: LogSystem = LogSystem(std::alloc::System);
+//
+// struct LogSystem(std::alloc::System);
+//
+// unsafe impl std::alloc::GlobalAlloc for LogSystem {
+//     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+//         // eprintln!("allocating {} bytes", layout.size());
+//         self.0.alloc(layout)
+//     }
+//
+//     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+//         self.0.dealloc(ptr, layout)
+//     }
+// }

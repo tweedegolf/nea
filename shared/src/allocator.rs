@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-const INITIAL_ARENA_SIZE: usize = 4096 * 32;
+const INITIAL_ARENA_SIZE: usize = 4096 * 128;
 const MAX_SUPPORTED_ALIGN: usize = 4096;
 #[repr(C, align(4096))] // 4096 == MAX_SUPPORTED_ALIGN
 pub struct ServerAlloc {
@@ -38,7 +38,10 @@ impl ServerAlloc {
         bucket_index: usize,
     ) -> Option<NonNull<u8>> {
         let buckets = unsafe { *self.buckets.get() };
-        let bucket = &buckets[bucket_index];
+        let Some(bucket) = buckets.get(bucket_index) else {
+            log::error!("bucket index {bucket_index} is out of range");
+            panic!();
+        };
 
         try_alloc_help(layout, bucket.start, &bucket.remaining)
     }
@@ -94,6 +97,7 @@ fn try_alloc_help(
     let mut allocated = 0;
     let result = remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |mut remaining| {
         if size > remaining {
+            log::error!("bucket has only {remaining} bytes left, not enough for {size} bytes");
             return None;
         }
         remaining -= size;

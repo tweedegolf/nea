@@ -157,6 +157,8 @@ unsafe impl Sync for Shared {}
 
 impl Shared {
     fn run(&self, mut poll: mio::Poll) -> std::io::Result<()> {
+        crate::ARENA_INDEX.with(|a| a.store(crate::ARENA_INDEX_REACTOR, Ordering::Relaxed));
+
         let queue_capacity = self.sources.len() * self.io_resources.per_bucket();
         let mut events = Events::with_capacity(queue_capacity);
         let mut wakers = Vec::with_capacity(queue_capacity);
