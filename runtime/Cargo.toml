@@ -11,8 +11,7 @@ path = "../examples/app.rs"
 
 [dependencies]
 hyper = { version = "1.0.0-rc.4", features = ["client", "http1", "http2"] }
-log = "0.4.20"
-env_logger = "0.10.0"
+log = { path = "../log" }
 mio = { version = "0.8.8", features = ["os-poll", "net"] }
 serde = { version = "1.0.186", features = ["derive"] }
 slab = "0.4.8"

@@ -186,7 +186,7 @@ fn handle_stream(mut stream: &TcpStream) -> std::io::Result<()> {
 static INDEXER: Indexer = Indexer::new();
 
 fn main() {
-    env_logger::init();
+    log::init();
 
     const QUEUE_SIZE: usize = 16;
 
