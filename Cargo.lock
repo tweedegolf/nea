@@ -296,10 +296,15 @@ dependencies = [
 name = "nea"
 version = "0.1.0"
 dependencies = [
+ "atomic-wait",
  "cc",
+ "hyper",
  "log 0.1.0",
+ "mio",
  "roc_app",
+ "serde",
  "shared",
+ "toml 0.8.0",
 ]
 
 [[package]]
@@ -371,7 +376,7 @@ dependencies = [
  "serde",
  "shared",
  "slab",
- "toml",
+ "toml 0.7.6",
 ]
 
 [[package]]
@@ -439,6 +444,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-server"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "log 0.1.0",
+ "roc_app",
+ "shared",
+]
+
+[[package]]
 name = "tokio"
 version = "1.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,7 +487,19 @@ dependencies = [
  "serde",
  "serde_spanned",
  "toml_datetime",
- "toml_edit",
+ "toml_edit 0.19.14",
+]
+
+[[package]]
+name = "toml"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c226a7bba6d859b63c92c4b4fe69c5b6b72d0cb897dbc8e6012298e6154cb56e"
+dependencies = [
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_edit 0.20.0",
 ]
 
 [[package]]
@@ -489,6 +516,19 @@ name = "toml_edit"
 version = "0.19.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8123f27e969974a3dfba720fdb560be359f57b44302d280ba72e76a74480e8a"
+dependencies = [
+ "indexmap 2.0.0",
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "winnow",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ff63e60a958cefbb518ae1fd6566af80d9d4be430a33f3723dfc47d1d411d95"
 dependencies = [
  "indexmap 2.0.0",
  "serde",
