@@ -5,6 +5,7 @@ members = [
     "roc_app",
     "server",
     "runtime",
+    "async-server",
 ]
 resolver = "2"
 

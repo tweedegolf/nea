@@ -39,8 +39,9 @@ impl ServerAlloc {
     ) -> Option<NonNull<u8>> {
         let buckets = unsafe { *self.buckets.get() };
         let Some(bucket) = buckets.get(bucket_index) else {
-            log::error!("bucket index {bucket_index} is out of range");
-            panic!();
+            let thread = std::thread::current().id();
+            log::error!("{thread:?}: bucket index {bucket_index} is out of range");
+            return None;
         };
 
         try_alloc_help(layout, bucket.start, &bucket.remaining)
