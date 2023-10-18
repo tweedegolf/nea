@@ -1,0 +1,20 @@
+[package]
+name = "nea"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+shared = { path = "../shared" }
+
+log = { path = "../log" }
+mio = { version = "0.8.8", features = ["os-poll", "net"] }
+atomic-wait = "1.1.0"
+serde = { version = "1.0.186", features = ["derive"] }
+hyper = { version = "1.0.0-rc.4", features = ["client", "http1", "http2"] }
+toml = "0.8.0"
+
+[build-dependencies]
+roc_app = { path = "../roc_app" }
+cc = "1.0"
