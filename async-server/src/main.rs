@@ -10,6 +10,7 @@ use std::{
 mod config;
 mod executor;
 mod index;
+mod queue;
 mod reactor;
 
 use config::Config;
