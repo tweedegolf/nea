@@ -57,8 +57,10 @@ pub struct Executor<F: 'static> {
 type PinBoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Inner<F> {
+    /// How many queue slots are there per bucket
     io_resources: IoResources,
-    //    refcounts: Box<[Refcount]>,
+    /// number of active queue slots for each bucket
+    refcounts: Box<[Mutex<u8>]>,
     futures: Box<[Mutex<Option<F>>]>,
     //    connections: Box<[Mutex<Slot<Http2Connection>>]>,
     //    http2_futures: Box<[Mutex<Slot<PinBoxFuture>>]>,
@@ -81,11 +83,16 @@ where
                     .take(queue_capacity)
                     .collect();
 
+                let refcounts = std::iter::repeat_with(|| Mutex::new(0))
+                    .take(queue_capacity)
+                    .collect();
+
                 let queue = ComplexQueue::with_capacity(queue_capacity);
 
                 let inner = Inner {
                     io_resources,
                     futures,
+                    refcounts,
                     queue,
                 };
 
@@ -158,12 +165,9 @@ where
                     'enqueued_while_processing: loop {
                         match self.poll_input_stream(queue_index, bucket_index) {
                             Poll::Ready(()) => {
-                                // must block if there is a race condition with the executor trying to find a free slot
-                                let mut future_guard =
-                                    self.futures[bucket_index.index as usize].lock().unwrap();
-
-                                // clear the memory
-                                ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
+                                let mut future_guard = self.futures[bucket_index.index as usize]
+                                    .try_lock()
+                                    .unwrap();
 
                                 // this future is now done
                                 let old = future_guard.take();
@@ -171,7 +175,24 @@ where
 
                                 drop(old);
 
-                                let _ = self.queue.done_with_item_forever(&mut queue_guard);
+                                drop(future_guard);
+
+                                // must block if there is a race condition with the executor trying to find a free slot
+                                let mut bucket_guard =
+                                    self.refcounts[bucket_index.index as usize].lock().unwrap();
+
+                                // this queue index is now done
+
+                                if *bucket_guard == 1 {
+                                    // clear the memory
+                                    ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
+
+                                    let _ = self.queue.done_with_item_forever(&mut queue_guard);
+
+                                    *bucket_guard = 0;
+                                } else {
+                                    *bucket_guard -= 1;
+                                }
 
                                 continue 'outer;
                             }
@@ -198,8 +219,9 @@ where
     }
 
     fn poll_input_stream(&self, queue_index: QueueIndex, bucket_index: BucketIndex) -> Poll<()> {
-        // must block if there is a race condition with the executor trying to find a free slot
-        let mut task_mut = self.futures[bucket_index.index as usize].lock().unwrap();
+        let mut task_mut = self.futures[bucket_index.index as usize]
+            .try_lock()
+            .unwrap();
 
         let fut = match task_mut.as_mut() {
             None => panic!("race condition"),
@@ -221,12 +243,21 @@ where
             .unwrap()
             .replace(fut);
 
+        // NOTE try_claim already set the refcount of this slot to 1
+
         assert!(old_value.is_none())
     }
 
     fn try_claim(&self) -> Option<BucketIndex> {
-        let bucket_index = self.futures.iter().position(|f| match f.try_lock() {
-            Ok(slot) => slot.is_none(),
+        let bucket_index = self.refcounts.iter().position(|f| match f.try_lock() {
+            Ok(mut slot) => {
+                if *slot == 0 {
+                    *slot = 1;
+                    true
+                } else {
+                    false
+                }
+            }
             Err(_) => false,
         })?;
 
