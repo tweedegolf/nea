@@ -101,6 +101,8 @@ impl Reactor {
             )
             .unwrap();
 
+        log::info!("queue index {} added to poll", index.index);
+
         let tcp_stream = TcpStream {
             tcp_stream,
             reactor: *self,
@@ -202,7 +204,7 @@ impl Shared {
 
             let mut interest = source.interest.lock().expect("event loop");
 
-            if event.is_readable() {
+            if event.is_readable() && !event.is_read_closed() {
                 // TODO when is this waker None?
                 if let Some(waker) = interest[Direction::Read as usize].take() {
                     wakers.push(waker);
@@ -212,7 +214,7 @@ impl Shared {
                 source.triggered[Direction::Read as usize].store(true, Ordering::Release);
             }
 
-            if event.is_writable() {
+            if event.is_writable() && !event.is_write_closed() {
                 // TODO when is this waker None?
                 if let Some(waker) = interest[Direction::Write as usize].take() {
                     wakers.push(waker);
@@ -224,6 +226,7 @@ impl Shared {
         }
 
         for waker in wakers.drain(..) {
+            eprintln!("reactor waking wakers");
             waker.wake();
         }
 
@@ -283,6 +286,11 @@ impl TcpStream {
             self.poll_io(Direction::Write, || (&self.tcp_stream).write(buf), cx)
         })
         .await
+    }
+
+    pub async fn flush(&self) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| self.poll_io(Direction::Write, || (&self.tcp_stream).flush(), cx))
+            .await
     }
 }
 
@@ -349,7 +357,7 @@ impl hyper::rt::Write for TcpStream {
 impl Drop for TcpStream {
     fn drop(&mut self) {
         let index = QueueIndex::from_usize(self.token.0).index as usize;
-        log::info!("token {} removed from poll", index);
+        log::info!("queue index {} removed from poll", index);
 
         let _ = self
             .reactor

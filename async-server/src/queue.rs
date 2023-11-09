@@ -30,18 +30,20 @@ impl Refcount2 {
         }
     }
 
-    fn increment_active(&self) {
+    fn increment_active(&self) -> u32 {
         let mut guard = self.active_mutex.lock().unwrap();
         *guard = guard.checked_add(1).expect("no overflow");
+        *guard
     }
 
     fn wake_one(&self) {
         self.active_condvar.notify_one()
     }
 
-    fn decrement_active(&self) {
+    fn decrement_active(&self) -> u32 {
         let mut guard = self.active_mutex.lock().unwrap();
         *guard = guard.checked_sub(1).expect("no underflow");
+        *guard
     }
 
     fn wait_active(&self) -> u32 {
@@ -114,23 +116,35 @@ impl ComplexQueue {
         }
     }
 
-    fn increment_jobs_available(&self) {
+    fn increment_jobs_available(&self) -> u32 {
         self.jobs_in_queue.increment_active()
     }
 
-    fn decrement_jobs_available(&self) {
-        self.jobs_in_queue.decrement_active()
+    fn decrement_jobs_available(&self) -> u32 {
+        let x = self.jobs_in_queue.decrement_active();
+
+        let thread = thread::current().id();
+
+        x
     }
 
     fn wait_jobs_available(&self) -> u32 {
         self.jobs_in_queue.wait_active()
     }
 
-    pub fn enqueue(&self, index: QueueIndex) -> Result<(), QueueIndex> {
+    pub fn is_enqueued(&self, index: QueueIndex) -> bool {
         let current = &self.queue[index.index as usize];
 
-        // eagerly increment (but don't wake anyone yet)
-        self.increment_jobs_available();
+        // mark this slot as enqueue'd
+        let guard = current.lock().unwrap();
+
+        *guard & ENQUEUED_BIT != 0
+    }
+
+    pub fn enqueue(&self, index: QueueIndex) -> Result<(), QueueIndex> {
+        let thread = thread::current().id();
+
+        let current = &self.queue[index.index as usize];
 
         // mark this slot as enqueue'd
         let mut guard = current.lock().unwrap();
@@ -140,19 +154,19 @@ impl ComplexQueue {
         *guard |= ENQUEUED_BIT;
 
         if old_value & ENQUEUED_BIT == 0 && old_value & IN_PROGRESS_BIT == 0 {
+            log::warn!("{thread:?}: ☀️  job {} is new in the queue", index.index);
+
+            drop(guard);
+
+            // eagerly increment (but don't wake anyone yet)
+            let jobs_available = self.increment_jobs_available();
+
             // this is a new job, notify a worker
             self.jobs_in_queue.wake_one();
-
-            let thread = thread::current().id();
-            log::warn!(
-                "{thread:?}: ++++++++++ job {} is new in the queue",
-                index.index
-            );
         } else {
             // the job was already enqueue'd, revert
-            self.decrement_jobs_available();
+            // self.decrement_jobs_available();
 
-            let thread = thread::current().id();
             log::warn!(
                 "{thread:?}: ++++++++++ job {} was already in the queue ({}, {})",
                 index.index,
@@ -197,7 +211,10 @@ impl ComplexQueue {
             // find a task that is enqueued but not yet in progress
             let mut guard = match value.try_lock() {
                 Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::WouldBlock) => {
+                    eprintln!("job {} would block", i);
+                    continue;
+                }
                 Err(TryLockError::Poisoned(e)) => panic!("{e:?}"),
             };
 
@@ -209,10 +226,10 @@ impl ComplexQueue {
 
             *guard = IN_PROGRESS_BIT;
 
-            let thread = thread::current().id();
-            log::warn!("{thread:?}: picked {i} {old:b}");
+            let now_available = self.decrement_jobs_available();
 
-            self.decrement_jobs_available();
+            let thread = thread::current().id();
+            log::warn!("{thread:?}: picked {i} {old:b} (now {now_available} available)");
 
             let index = QueueIndex {
                 index: i as u32,
@@ -229,8 +246,10 @@ impl ComplexQueue {
         let thread = thread::current().id();
 
         loop {
+            log::warn!("{thread:?}: 😴");
+
             let n = self.wait_jobs_available();
-            log::warn!("{thread:?}: done waiting, {n} jobs available");
+            log::warn!("{thread:?}: ⚙️  done waiting, {n} jobs available");
 
             if let Some((index, guard)) = self.try_dequeue() {
                 return (index, guard);
