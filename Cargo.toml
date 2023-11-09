@@ -6,6 +6,9 @@ members = [
     "server",
     "runtime",
     "async-server",
+    "loom-tests",
 ]
 resolver = "2"
+
+
 

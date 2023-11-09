@@ -367,7 +367,7 @@ impl hyper::rt::Write for TcpStream {
 impl Drop for TcpStream {
     fn drop(&mut self) {
         let index = QueueIndex::from_usize(self.token.0).index as usize;
-        log::info!("token {} removed from poll", index);
+        log::warn!("token {} removed from poll", index);
 
         let _ = self
             .reactor

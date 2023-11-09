@@ -256,6 +256,7 @@ impl<F> Executor<F> {
 
         let queue_index =
             QueueIndex::from_connection_index(self.inner.io_resources, connection_index);
+        dbg!(queue_index);
         let stream = reactor.register(queue_index, stream).unwrap();
 
         // let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();

@@ -163,13 +163,16 @@ fn main() -> std::io::Result<()> {
 
     let config = Config::load();
 
-    ALLOCATOR.0.initialize_buckets(config.bucket_count, 4096)?;
+    ALLOCATOR
+        .0
+        .initialize_buckets(config.bucket_count, 4096 * 32)?;
 
     let executor = Executor::get_or_init(config.bucket_count, config.io_resources);
     let reactor = Reactor::get_or_init(config.bucket_count, config.io_resources).unwrap();
 
     let _handle1 = executor.spawn_worker().unwrap();
-    let _handle2 = executor.spawn_worker().unwrap();
+    // let _handle2 = executor.spawn_worker().unwrap();
+    // let _handle3 = executor.spawn_worker().unwrap();
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = std::net::TcpListener::bind(&addr)?;
@@ -201,7 +204,7 @@ fn main() -> std::io::Result<()> {
                         QueueIndex::from_bucket_index(config.io_resources, bucket_index);
                     let tcp_stream = reactor.register(queue_index, stream).unwrap();
 
-                    match handler(bucket_index, tcp_stream).await {
+                    match hyper_app(bucket_index, tcp_stream).await {
                         Ok(()) => {}
                         Err(e) => match e.kind() {
                             ErrorKind::NotConnected => {}
@@ -234,7 +237,6 @@ enum Msg {
 #[derive(Debug)]
 enum Model {
     Initial,
-    Reading(Vec<u8>),
     Writing,
 }
 
@@ -262,17 +264,6 @@ fn roc_handler(model: Model, msg: Msg) -> (Model, Cmd) {
 
             (Model::Writing, Cmd::Write(buf))
         }
-        (Model::Reading(mut buf), Msg::Read(new)) => {
-            // assume eof
-            buf.extend(new);
-            (Model::Writing, Cmd::Write(buf))
-            //            } else {
-            //                // continue reading
-            //                buf.extend(new);
-            //                (Model::Reading(buf), Cmd::Read)
-            //            }
-        }
-        (Model::Reading(_), Msg::Nothing) => unreachable!(),
         (Model::Writing, _) => (Model::Writing, Cmd::Done),
     }
 }
@@ -307,6 +298,66 @@ async fn handler(
             Cmd::Done => break,
         }
     }
+
+    Ok(())
+}
+
+#[allow(unused)]
+async fn hyper_app(
+    bucket_index: BucketIndex,
+    tcp_stream: reactor::TcpStream,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut buffer = [0; 1024];
+    let n = tcp_stream.read(&mut buffer).await?;
+
+    let input = &buffer[..n];
+    let input = std::str::from_utf8(input).unwrap();
+
+    let url = "https://github.com/hyperium/hyper/blob/master/examples/client.rs"
+        .parse::<hyper::Uri>()
+        .unwrap();
+    let host = url.host().expect("uri has no host");
+    let port = url.port_u16().unwrap_or(80);
+
+    let mut sender = executor::Executor::<()>::get()
+        .unwrap()
+        .handshake(bucket_index, host, port)
+        .await
+        .unwrap();
+
+    log::info!("performed handshake {}", bucket_index.index);
+
+    let authority = url.authority().unwrap().clone();
+
+    let req = hyper::Request::builder()
+        .header("Host", "example.com")
+        .method("GET")
+        .body(String::new())
+        .unwrap();
+
+    log::info!("built request");
+
+    let res = sender.send_request(req).await.unwrap();
+    log::info!("sent request");
+
+    // Stream the body, writing each frame to stdout as it arrives
+    res.into_body();
+
+    let mut buffer = [0u8; 1024];
+    let mut response = Cursor::new(&mut buffer[..]);
+    let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
+    let _ = response.write_all(b"Content-Type: text/html\r\n");
+    let _ = response.write_all(b"\r\n");
+    let _ = response.write_fmt(format_args!("<html>{input}</html>"));
+    let n = response.position() as usize;
+
+    tcp_stream.write(&response.get_ref()[..n]).await?;
+
+    tcp_stream.flush().await?;
+
+    log::info!("handled a request");
 
     Ok(())
 }
