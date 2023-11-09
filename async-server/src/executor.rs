@@ -311,184 +311,67 @@ where
             CURRENT_ARENA.with(|a| a.store(bucket_index.index, Ordering::Release));
 
             let io_index = IoIndex::from_index(self.io_resources, queue_index);
-            match io_index {
-                IoIndex::InputStream(bucket_index) => {
-                    'enqueued_while_processing: loop {
-                        match self.poll_input_stream(queue_index, bucket_index) {
-                            Poll::Ready(()) => {
-                                {
-                                    let mut future_guard = self.futures
-                                        [bucket_index.index as usize]
-                                        .try_lock()
-                                        .unwrap();
 
-                                    // this future is now done
-                                    let old = future_guard.take();
-                                    assert!(old.is_some());
-
-                                    drop(old);
-
-                                    drop(future_guard);
-                                }
-
-                                // must block if there is a race condition with the executor trying to find a free slot
-                                let mut bucket_guard =
-                                    self.refcounts[bucket_index.index as usize].lock().unwrap();
-
-                                log::warn!(
-                                    "1. 💀 job {} (rc now {})",
-                                    queue_index.index,
-                                    bucket_guard.saturating_sub(1),
-                                );
-
-                                // this queue index is now done
-
-                                if *bucket_guard == 1 {
-                                    // clear the memory
-                                    ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
-
-                                    let _ = self.queue.done_with_item_forever(&mut queue_guard);
-
-                                    *bucket_guard = 0;
-                                } else {
-                                    *bucket_guard -= 1;
-
-                                    assert!(matches!(
-                                        self.queue.done_with_item(&mut queue_guard),
-                                        DoneWithItem::Done
-                                    ));
-                                }
-
-                                *queue_guard &= !IN_PROGRESS_BIT;
-                                continue 'outer;
-                            }
-                            Poll::Pending => {
-                                //
-                                match self.queue.done_with_item(&mut queue_guard) {
-                                    DoneWithItem::Done => {
-                                        *queue_guard &= !IN_PROGRESS_BIT;
-                                        break 'enqueued_while_processing;
-                                    }
-                                    DoneWithItem::GoAgain => {
-                                        continue 'enqueued_while_processing;
-                                    }
-                                }
-                            }
-                        }
+            'enqueued_while_processing: loop {
+                let poll_result = match io_index {
+                    IoIndex::InputStream(bucket_index) => {
+                        self.poll_input_stream(queue_index, bucket_index)
                     }
-                }
-                IoIndex::CustomStream(_) => todo!(),
-                IoIndex::HttpConnection(connection_index) => {
-                    'enqueued_while_processing: loop {
-                        match self.poll_http_connection(queue_index, connection_index) {
-                            Poll::Ready(()) => {
-                                // NOTE: the future is already dropped by poll_http_connection
-
-                                // must block if there is a race condition with the executor trying to find a free slot
-                                let mut bucket_guard =
-                                    self.refcounts[bucket_index.index as usize].lock().unwrap();
-
-                                log::warn!(
-                                    "2. 💀 job {} (rc now {})",
-                                    queue_index.index,
-                                    bucket_guard.saturating_sub(1),
-                                );
-
-                                // this queue index is now done
-
-                                if *bucket_guard == 1 {
-                                    // clear the memory
-                                    ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
-
-                                    let _ = self.queue.done_with_item_forever(&mut queue_guard);
-
-                                    *bucket_guard = 0;
-                                } else {
-                                    *bucket_guard -= 1;
-
-                                    assert!(matches!(
-                                        self.queue.done_with_item(&mut queue_guard),
-                                        DoneWithItem::Done
-                                    ));
-                                }
-
-                                *queue_guard &= !IN_PROGRESS_BIT;
-                                continue 'outer;
-                            }
-                            Poll::Pending => {
-                                //
-                                match self.queue.done_with_item(&mut queue_guard) {
-                                    DoneWithItem::Done => {
-                                        *queue_guard &= !IN_PROGRESS_BIT;
-                                        break 'enqueued_while_processing;
-                                    }
-                                    DoneWithItem::GoAgain => {
-                                        continue 'enqueued_while_processing;
-                                    }
-                                }
-                            }
-                        }
+                    IoIndex::CustomStream(_) => todo!(),
+                    IoIndex::HttpConnection(connection_index) => {
+                        self.poll_http_connection(queue_index, connection_index)
                     }
-                }
-                IoIndex::Http2Future(future_index) => {
-                    'enqueued_while_processing: loop {
-                        match self.poll_http2_future(queue_index, future_index) {
-                            Poll::Ready(()) => {
-                                // NOTE: the future is already dropped by poll_http2_future
-
-                                // must block if there is a race condition with the executor trying to find a free slot
-                                let mut bucket_guard =
-                                    self.refcounts[bucket_index.index as usize].lock().unwrap();
-
-                                log::warn!(
-                                    "3. 💀 job {} (rc now {})",
-                                    queue_index.index,
-                                    bucket_guard.saturating_sub(1),
-                                );
-
-                                // this queue index is now done
-                                match *bucket_guard {
-                                    0 => {
-                                        // for some reason this can happen with http2 futures
-                                    }
-                                    1 => {
-                                        self.queue.done_with_item(&mut queue_guard);
-                                        // clear the memory
-                                        ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
-
-                                        let _ = self.queue.done_with_item_forever(&mut queue_guard);
-
-                                        *bucket_guard = 0;
-                                    }
-                                    _ => {
-                                        *bucket_guard -= 1;
-
-                                        assert!(matches!(
-                                            self.queue.done_with_item(&mut queue_guard),
-                                            DoneWithItem::Done
-                                        ));
-                                    }
-                                };
-
-                                *queue_guard &= !IN_PROGRESS_BIT;
-                                continue 'outer;
-                            }
-                            Poll::Pending => {
-                                //
-                                match self.queue.done_with_item(&mut queue_guard) {
-                                    DoneWithItem::Done => {
-                                        *queue_guard &= !IN_PROGRESS_BIT;
-                                        break 'enqueued_while_processing;
-                                    }
-                                    DoneWithItem::GoAgain => {
-                                        continue 'enqueued_while_processing;
-                                    }
-                                }
-                            }
-                        }
+                    IoIndex::Http2Future(future_index) => {
+                        self.poll_http2_future(queue_index, future_index)
                     }
+                };
+
+                match poll_result {
+                    Poll::Ready(()) => {
+                        // NOTE: the future is already dropped by the polling functions
+
+                        // must block if there is a race condition with the executor trying to find a free slot
+                        let mut bucket_guard =
+                            self.refcounts[bucket_index.index as usize].lock().unwrap();
+
+                        log::warn!(
+                            "💀 job {} (rc now {})",
+                            queue_index.index,
+                            bucket_guard.saturating_sub(1),
+                        );
+
+                        assert!(*bucket_guard != 0);
+
+                        if *bucket_guard == 1 {
+                            // clear the memory
+                            ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
+
+                            let _ = self.queue.done_with_item_forever(&mut queue_guard);
+
+                            *bucket_guard = 0;
+                        } else {
+                            *bucket_guard -= 1;
+
+                            assert!(matches!(
+                                self.queue.done_with_item(&mut queue_guard),
+                                DoneWithItem::Done
+                            ));
+                        }
+
+                        *queue_guard &= !IN_PROGRESS_BIT;
+                        continue 'outer;
+                    }
+                    Poll::Pending => match self.queue.done_with_item(&mut queue_guard) {
+                        DoneWithItem::Done => {
+                            *queue_guard &= !IN_PROGRESS_BIT;
+                            continue 'outer;
+                        }
+                        DoneWithItem::GoAgain => {
+                            continue 'enqueued_while_processing;
+                        }
+                    },
                 }
-            };
+            }
         }
     }
 
@@ -508,7 +391,14 @@ where
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
-        pinned.poll(&mut cx)
+        // early return if pending
+        let () = std::task::ready!(pinned.poll(&mut cx));
+
+        // this future is now done
+        let old = task_mut.take();
+        assert!(old.is_some());
+
+        Poll::Ready(())
     }
 
     fn poll_http_connection(
@@ -530,23 +420,21 @@ where
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
-        match pinned.poll(&mut cx) {
-            std::task::Poll::Ready(result) => {
-                let Some(connection) = task_mut.take() else {
-                    panic!("no connection");
-                };
+        // early return if pending
+        let result = std::task::ready!(pinned.poll(&mut cx));
 
-                // only stores PhandomData<TcpStream>. the actual stream is not in here
-                drop(connection);
+        let Some(connection) = task_mut.take() else {
+            panic!("no connection");
+        };
 
-                if let Err(e) = result {
-                    log::warn!("error in http connection {e:?}");
-                }
+        // only stores PhandomData<TcpStream>. the actual stream is not in here
+        drop(connection);
 
-                Poll::Ready(())
-            }
-            std::task::Poll::Pending => Poll::Pending,
+        if let Err(e) = result {
+            log::warn!("error in http connection {e:?}");
         }
+
+        Poll::Ready(())
     }
 
     fn poll_http2_future(
@@ -567,19 +455,17 @@ where
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
-        match connection.as_mut().poll(&mut cx) {
-            std::task::Poll::Ready(_) => {
-                let Some(fut) = task_mut.take() else {
-                    panic!("no http2 future");
-                };
+        // early return when pending
+        let () = std::task::ready!(connection.as_mut().poll(&mut cx));
 
-                // this _should_ close the underlying TCP stream
-                std::mem::forget(fut);
+        let Some(fut) = task_mut.take() else {
+            panic!("no http2 future");
+        };
 
-                Poll::Ready(())
-            }
-            std::task::Poll::Pending => Poll::Pending,
-        }
+        // this _should_ close the underlying TCP stream
+        std::mem::drop(fut);
+
+        Poll::Ready(())
     }
 
     fn set(&self, index: BucketIndex, fut: F) {

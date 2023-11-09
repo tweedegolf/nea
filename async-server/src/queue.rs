@@ -212,7 +212,6 @@ impl ComplexQueue {
             let mut guard = match value.try_lock() {
                 Ok(guard) => guard,
                 Err(TryLockError::WouldBlock) => {
-                    eprintln!("job {} would block", i);
                     continue;
                 }
                 Err(TryLockError::Poisoned(e)) => panic!("{e:?}"),
