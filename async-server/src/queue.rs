@@ -1,18 +1,89 @@
-use std::ops::Range;
-use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicU32, AtomicUsize};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Condvar;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::Mutex;
 use std::thread;
 
 use crate::executor::QueueIndex;
 
-pub const ENQUEUED_BIT: u8 = 0b0001;
-pub const IN_PROGRESS_BIT: u8 = 0b0010;
+const ENQUEUED_BIT: u8 = 0b0001;
+const IN_PROGRESS_BIT: u8 = 0b0010;
+
+pub struct QueueSlotState {
+    pub is_enqueued: bool,
+    pub is_in_progress: bool,
+}
+
+pub struct QueueSlot(AtomicU8);
+
+impl QueueSlot {
+    const fn empty() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == 0
+    }
+
+    fn is_enqueued(&self) -> bool {
+        self.0.load(Ordering::Relaxed) & ENQUEUED_BIT != 0
+    }
+
+    fn is_in_progress(&self) -> bool {
+        self.0.load(Ordering::Relaxed) & IN_PROGRESS_BIT != 0
+    }
+
+    pub fn mark_empty(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    fn try_process(&self) -> Result<(), ()> {
+        match self.0.compare_exchange(
+            ENQUEUED_BIT,
+            IN_PROGRESS_BIT,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn mark_enqueued(&self) -> QueueSlotState {
+        let old = self.0.fetch_or(ENQUEUED_BIT, Ordering::Relaxed);
+
+        QueueSlotState {
+            is_enqueued: old & ENQUEUED_BIT != 0,
+            is_in_progress: old & IN_PROGRESS_BIT != 0,
+        }
+    }
+
+    fn mark_in_progress(&self) {
+        let old = self.0.fetch_or(IN_PROGRESS_BIT, Ordering::Relaxed);
+    }
+
+    pub fn clear_enqueued(&self) -> QueueSlotState {
+        let old = self.0.fetch_and(!ENQUEUED_BIT, Ordering::Relaxed);
+
+        QueueSlotState {
+            is_enqueued: old & ENQUEUED_BIT != 0,
+            is_in_progress: old & IN_PROGRESS_BIT != 0,
+        }
+    }
+
+    pub fn clear_in_progress(&self) -> QueueSlotState {
+        let old = self.0.fetch_and(!IN_PROGRESS_BIT, Ordering::Relaxed);
+
+        QueueSlotState {
+            is_enqueued: old & ENQUEUED_BIT != 0,
+            is_in_progress: old & IN_PROGRESS_BIT != 0,
+        }
+    }
+}
 
 pub struct ComplexQueue {
-    queue: Box<[Mutex<u8>]>,
+    queue: Box<[QueueSlot]>,
     // number of currently enqueued items
     jobs_in_queue: Refcount2,
 }
@@ -32,8 +103,17 @@ impl Refcount2 {
 
     fn increment_active(&self) -> u32 {
         let mut guard = self.active_mutex.lock().unwrap();
-        *guard = guard.checked_add(1).expect("no overflow");
-        *guard
+        match guard.checked_add(1) {
+            None => {
+                let thread = thread::current().id();
+                eprintln!("{thread:?}: RC does not overflow");
+                panic!("increment_active: overflow");
+            }
+            Some(v) => {
+                *guard = v;
+                v
+            }
+        }
     }
 
     fn wake_one(&self) {
@@ -42,8 +122,17 @@ impl Refcount2 {
 
     fn decrement_active(&self) -> u32 {
         let mut guard = self.active_mutex.lock().unwrap();
-        *guard = guard.checked_sub(1).expect("no underflow");
-        *guard
+        match guard.checked_sub(1) {
+            None => {
+                let thread = thread::current().id();
+                eprintln!("{thread:?}: RC does not overflow");
+                panic!("decrement_active: overflow");
+            }
+            Some(v) => {
+                *guard = v;
+                v
+            }
+        }
     }
 
     fn wait_active(&self) -> u32 {
@@ -106,7 +195,7 @@ pub enum DoneWithItem {
 
 impl ComplexQueue {
     pub fn with_capacity(capacity: usize) -> Self {
-        let queue = std::iter::repeat_with(|| Mutex::new(0))
+        let queue = std::iter::repeat_with(|| QueueSlot::empty())
             .take(capacity)
             .collect();
 
@@ -116,62 +205,53 @@ impl ComplexQueue {
         }
     }
 
+    pub fn capacity(&self) -> usize {
+        self.queue.len()
+    }
+
     fn increment_jobs_available(&self) -> u32 {
         self.jobs_in_queue.increment_active()
     }
 
     fn decrement_jobs_available(&self) -> u32 {
-        let x = self.jobs_in_queue.decrement_active();
+        self.jobs_in_queue.decrement_active()
+    }
 
-        let thread = thread::current().id();
-
-        x
+    fn load_jobs_available(&self) -> u32 {
+        *self.jobs_in_queue.active_mutex.lock().unwrap()
     }
 
     fn wait_jobs_available(&self) -> u32 {
         self.jobs_in_queue.wait_active()
     }
 
-    pub fn is_enqueued(&self, index: QueueIndex) -> bool {
-        let current = &self.queue[index.index as usize];
-
-        // mark this slot as enqueue'd
-        let guard = current.lock().unwrap();
-
-        *guard & ENQUEUED_BIT != 0
-    }
-
     pub fn enqueue(&self, index: QueueIndex) -> Result<(), QueueIndex> {
         let thread = thread::current().id();
 
-        let current = &self.queue[index.index as usize];
+        let Some(current) = self.queue.get(index.index as usize) else {
+            panic!("{thread:?}: queue index {index:?} out of bounds");
+        };
 
-        // mark this slot as enqueue'd
-        let mut guard = current.lock().unwrap();
+        // eagerly increment (but don't wake anyone yet). This is to prevent race conditions
+        // between marking the slot as enqueued and updating the count of enqueued slots.
+        let _jobs_available = self.increment_jobs_available();
 
-        // let old_value = current.fetch_or(ENQUEUED_BIT, Ordering::Relaxed);
-        let old_value = *guard;
-        *guard |= ENQUEUED_BIT;
+        let old_slot_state = current.mark_enqueued();
 
-        if old_value & ENQUEUED_BIT == 0 && old_value & IN_PROGRESS_BIT == 0 {
+        if !old_slot_state.is_enqueued && !old_slot_state.is_in_progress {
             log::warn!("{thread:?}: ☀️  job {} is new in the queue", index.index);
-
-            drop(guard);
-
-            // eagerly increment (but don't wake anyone yet)
-            let jobs_available = self.increment_jobs_available();
 
             // this is a new job, notify a worker
             self.jobs_in_queue.wake_one();
         } else {
             // the job was already enqueue'd, revert
-            // self.decrement_jobs_available();
+            self.decrement_jobs_available();
 
             log::warn!(
                 "{thread:?}: ++++++++++ job {} was already in the queue ({}, {})",
                 index.index,
-                format_args!("ENQUEUED_BIT: {}", old_value & ENQUEUED_BIT != 0),
-                format_args!("IN_PROGRESS_BIT: {}", old_value & IN_PROGRESS_BIT != 0),
+                format_args!("ENQUEUED_BIT: {}", old_slot_state.is_enqueued),
+                format_args!("IN_PROGRESS_BIT: {}", old_slot_state.is_in_progress),
             );
         }
 
@@ -179,14 +259,13 @@ impl ComplexQueue {
     }
 
     #[must_use]
-    pub fn done_with_item(&self, guard: &mut MutexGuard<u8>) -> DoneWithItem {
-        // let old_value = current.fetch_and(!ENQUEUED_BIT, Ordering::Relaxed);
-        let old_value = **guard;
-        **guard &= !ENQUEUED_BIT;
+    pub fn done_with_item(&self, queue_slot: &QueueSlot) -> DoneWithItem {
+        let old_slot_state = queue_slot.clear_enqueued();
 
-        assert!(old_value & IN_PROGRESS_BIT != 0);
+        assert!(old_slot_state.is_in_progress);
 
-        if old_value & ENQUEUED_BIT != 0 {
+        if old_slot_state.is_enqueued {
+            // slot got enqueued while processing; process it again
             DoneWithItem::GoAgain
         } else {
             // let old_value = current.fetch_and(!IN_PROGRESS_BIT, Ordering::Relaxed);
@@ -196,52 +275,44 @@ impl ComplexQueue {
         }
     }
 
-    pub fn done_with_item_forever(&self, guard: &mut MutexGuard<u8>) {
-        **guard = 0;
-    }
+    fn try_dequeue(&self) -> Option<(QueueIndex, &QueueSlot)> {
+        let thread = thread::current().id();
 
-    fn try_dequeue(&self) -> Option<(QueueIndex, MutexGuard<u8>)> {
         // first, try to find something
         let split_index = 0;
 
         let (later, first) = self.queue.split_at(split_index);
         let it = first.iter().chain(later).enumerate();
 
-        for (i, value) in it {
+        for (i, queue_slot) in it {
             // find a task that is enqueued but not yet in progress
-            let mut guard = match value.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::WouldBlock) => {
-                    continue;
-                }
-                Err(TryLockError::Poisoned(e)) => panic!("{e:?}"),
+            if let Err(()) = queue_slot.try_process() {
+                // either
+                //
+                // - the slot is empty
+                // - the slot is not enqueued
+                // - the slot is already in progress
+                continue;
             };
 
-            let old = *guard;
-
-            if *guard != ENQUEUED_BIT {
-                continue;
-            }
-
-            *guard = IN_PROGRESS_BIT;
-
+            // this has a (potential) race condition with the insertion. A value is marked as
+            // enqueued before the reference count is incremented
             let now_available = self.decrement_jobs_available();
 
-            let thread = thread::current().id();
-            log::warn!("{thread:?}: picked {i} {old:b} (now {now_available} available)");
+            log::warn!("{thread:?}: picked {i} (now {now_available} available)");
 
             let index = QueueIndex {
                 index: i as u32,
                 identifier: 0,
             };
 
-            return Some((index, guard));
+            return Some((index, queue_slot));
         }
 
         None
     }
 
-    pub fn blocking_dequeue(&self) -> (QueueIndex, MutexGuard<u8>) {
+    pub fn blocking_dequeue(&self) -> (QueueIndex, &QueueSlot) {
         let thread = thread::current().id();
 
         loop {
@@ -250,20 +321,16 @@ impl ComplexQueue {
             let n = self.wait_jobs_available();
             log::warn!("{thread:?}: ⚙️  done waiting, {n} jobs available");
 
-            if let Some((index, guard)) = self.try_dequeue() {
-                return (index, guard);
+            log::warn!(
+                "{thread:?}: blocking dequeue, {} available",
+                self.load_jobs_available()
+            );
+
+            if let Some((index, queue_slot)) = self.try_dequeue() {
+                return (index, queue_slot);
             } else {
                 log::warn!("{thread:?}: could not claim the promised job");
             }
-        }
-    }
-
-    pub fn clear_slots_for(&self, range: Range<usize>) {
-        use std::ops::DerefMut;
-
-        for slot in self.queue[range].iter() {
-            // let old = slot.swap(0, Ordering::Relaxed);
-            let old = std::mem::take(slot.lock().unwrap().deref_mut());
         }
     }
 }

@@ -226,7 +226,6 @@ impl Shared {
         }
 
         for waker in wakers.drain(..) {
-            eprintln!("reactor waking wakers");
             waker.wake();
         }
 
