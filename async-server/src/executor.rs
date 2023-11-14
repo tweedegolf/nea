@@ -5,18 +5,17 @@ use std::{
     future::Future,
     ops::DerefMut,
     pin::Pin,
-    sync::{atomic::Ordering, Mutex, MutexGuard, OnceLock},
+    sync::{atomic::Ordering, Mutex, OnceLock},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 pub use crate::index::{BucketIndex, ConnectionIndex, Http2FutureIndex, IoIndex, QueueIndex};
+use crate::CURRENT_ARENA;
 use crate::{
     index::IoResources,
-    queue::{ComplexQueue, DoneWithItem, IN_PROGRESS_BIT},
-    reactor::{self, Reactor},
-    ALLOCATOR, ARENA_INDEX_EXECUTOR,
+    queue::{ComplexQueue, DoneWithItem},
+    reactor, ARENA_INDEX_EXECUTOR,
 };
-use crate::{ARENA_INDEX_UNINITIALIZED, CURRENT_ARENA};
 
 const RAW_WAKER_V_TABLE: RawWakerVTable = {
     fn clone_raw(ptr: *const ()) -> RawWaker {
@@ -43,6 +42,8 @@ const RAW_WAKER_V_TABLE: RawWakerVTable = {
         if executor.inner.queue.enqueue(index).is_err() {
             log::warn!("task cannot be woken because the queue is full! ");
         }
+
+        log::warn!("{thread:?}: woke {}", index.index);
     }
 
     RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw)
@@ -145,7 +146,7 @@ where
                     .collect();
 
                 let refcounts = std::iter::repeat_with(|| Mutex::new(0))
-                    .take(queue_capacity)
+                    .take(bucket_count)
                     .collect();
 
                 let connection_count = bucket_count * io_resources.http_connections;
@@ -277,7 +278,6 @@ impl<F> Executor<F> {
 
         let queue_index =
             QueueIndex::from_connection_index(self.inner.io_resources, connection_index);
-        eprintln!("handshake");
         let stream = reactor.register(queue_index, stream).unwrap();
 
         // let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
@@ -304,7 +304,7 @@ where
 {
     fn run_worker(&self) -> ! {
         'outer: loop {
-            let (queue_index, mut queue_guard) = self.queue.blocking_dequeue();
+            let (queue_index, queue_slot) = self.queue.blocking_dequeue();
 
             // configure the allocator
             let bucket_index = queue_index.to_bucket_index(self.io_resources);
@@ -344,26 +344,34 @@ where
 
                         if *bucket_guard == 1 {
                             // clear the memory
-                            ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
+                            // ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
 
-                            let _ = self.queue.done_with_item_forever(&mut queue_guard);
+                            queue_slot.mark_empty();
 
                             *bucket_guard = 0;
+
+                            continue 'outer;
                         } else {
                             *bucket_guard -= 1;
 
-                            assert!(matches!(
-                                self.queue.done_with_item(&mut queue_guard),
-                                DoneWithItem::Done
-                            ));
-                        }
+                            let old_slot_state = queue_slot.clear_in_progress();
 
-                        *queue_guard &= !IN_PROGRESS_BIT;
-                        continue 'outer;
+                            // this slot is done, so should not be enqueued by anyone
+                            // however it looks like tasks can enqueue themselves?
+                            queue_slot.clear_enqueued();
+
+                            //                            assert!(
+                            //                                !old_slot_state.is_enqueued,
+                            //                                "{thread:?}: job {} {io_index:?} is enqueued but also done",
+                            //                                queue_index.index
+                            //                            );
+
+                            continue 'outer;
+                        }
                     }
-                    Poll::Pending => match self.queue.done_with_item(&mut queue_guard) {
+                    Poll::Pending => match self.queue.done_with_item(queue_slot) {
                         DoneWithItem::Done => {
-                            *queue_guard &= !IN_PROGRESS_BIT;
+                            queue_slot.clear_in_progress();
                             continue 'outer;
                         }
                         DoneWithItem::GoAgain => {
@@ -446,8 +454,12 @@ where
             .lock()
             .unwrap();
 
+        let thread = std::thread::current().id();
+        // log::error!("{thread:?}: {}", queue_index.index);
+
         let Some(connection) = task_mut.deref_mut() else {
             log::error!("http2 future in the queue, but there is no future");
+            panic!();
             return Poll::Ready(());
         };
 
@@ -456,7 +468,13 @@ where
         let mut cx = Context::from_waker(&waker);
 
         // early return when pending
-        let () = std::task::ready!(connection.as_mut().poll(&mut cx));
+        let () = match connection.as_mut().poll(&mut cx) {
+            Poll::Ready(x) => x,
+            Poll::Pending => {
+                // log::error!("{thread:?}: {} pending", queue_index.index);
+                return Poll::Pending;
+            }
+        };
 
         let Some(fut) = task_mut.take() else {
             panic!("no http2 future");
@@ -464,6 +482,8 @@ where
 
         // this _should_ close the underlying TCP stream
         std::mem::drop(fut);
+
+        // log::error!("{thread:?}: {} done", queue_index.index);
 
         Poll::Ready(())
     }
@@ -494,6 +514,8 @@ where
 
         let index = bucket_index as u32;
         let identifier = 0;
-        Some(BucketIndex { identifier, index })
+        let bucket_index = BucketIndex { identifier, index };
+
+        Some(bucket_index)
     }
 }

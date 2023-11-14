@@ -29,7 +29,7 @@ impl ServerAlloc {
         layout: std::alloc::Layout,
     ) -> Option<NonNull<u8>> {
         let non_null = NonNull::new(self.initial_arena.get().cast()).unwrap();
-        try_alloc_help(layout, non_null, &self.initial_arena_remaining)
+        try_alloc_help(layout, non_null, &self.initial_arena_remaining, -1)
     }
 
     pub fn try_allocate_in_bucket(
@@ -44,7 +44,12 @@ impl ServerAlloc {
             return None;
         };
 
-        try_alloc_help(layout, bucket.start, &bucket.remaining)
+        try_alloc_help(
+            layout,
+            bucket.start,
+            &bucket.remaining,
+            bucket_index as isize,
+        )
     }
 
     pub fn clear_bucket(&self, bucket_index: usize) {
@@ -83,6 +88,7 @@ fn try_alloc_help(
     layout: std::alloc::Layout,
     origin: NonNull<u8>,
     remaining: &AtomicUsize,
+    bucket_index: isize,
 ) -> Option<NonNull<u8>> {
     let size = layout.size();
     let align = layout.align();
@@ -98,7 +104,7 @@ fn try_alloc_help(
     let mut allocated = 0;
     let result = remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |mut remaining| {
         if size > remaining {
-            log::error!("bucket has only {remaining} bytes left, not enough for {size} bytes");
+            log::error!("bucket {bucket_index} has only {remaining} bytes left, not enough for {size} bytes");
             return None;
         }
         remaining -= size;

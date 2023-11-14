@@ -85,7 +85,16 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
 
     eprintln!("arena {bucket_index}: allocating {size} bytes",);
 
-    match ALLOCATOR.0.try_allocate_in_bucket(layout, bucket_index) {
+    //    match ALLOCATOR.0.try_allocate_in_bucket(layout, bucket_index) {
+    //        None => {
+    //            let msg = b"out of memory\0";
+    //            let panic_tag = 1;
+    //            roc_panic(msg.map(|x| x as std::ffi::c_char).as_ptr(), panic_tag)
+    //        }
+    //        Some(non_null) => non_null,
+    //    }
+
+    match NonNull::new(std::alloc::alloc(layout)) {
         None => {
             let msg = b"out of memory\0";
             let panic_tag = 1;
@@ -100,8 +109,8 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
 /// This is where the magic happens
 struct ServerAlloc(shared::allocator::ServerAlloc);
 
-#[global_allocator]
-static ALLOCATOR: ServerAlloc = ServerAlloc(shared::allocator::ServerAlloc::new());
+// #[global_allocator]
+// static ALLOCATOR: ServerAlloc = ServerAlloc(shared::allocator::ServerAlloc::new());
 
 unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
@@ -163,15 +172,13 @@ fn main() -> std::io::Result<()> {
 
     let config = Config::load();
 
-    ALLOCATOR
-        .0
-        .initialize_buckets(config.bucket_count, 4096 * 32)?;
+    // ALLOCATOR .0 .initialize_buckets(config.bucket_count, 4096 * 128)?;
 
     let executor = Executor::get_or_init(config.bucket_count, config.io_resources);
     let reactor = Reactor::get_or_init(config.bucket_count, config.io_resources).unwrap();
 
     let _handle1 = executor.spawn_worker().unwrap();
-    // let _handle2 = executor.spawn_worker().unwrap();
+    let _handle2 = executor.spawn_worker().unwrap();
     // let _handle3 = executor.spawn_worker().unwrap();
 
     let addr = format!("{}:{}", config.host, config.port);
