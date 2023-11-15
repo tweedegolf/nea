@@ -3,6 +3,7 @@
 use hyper::rt::ReadBufCursor;
 use std::io::Error;
 use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::{
     io::Write,
@@ -193,8 +194,8 @@ impl Shared {
         }
 
         for event in events.iter() {
-            let task_index = QueueIndex::from_usize(event.token().0);
-            let index = task_index.index as usize;
+            let queue_index = QueueIndex::from_usize(event.token().0);
+            let index = queue_index.index as usize;
             let source = self.sources[index].lock().unwrap();
 
             let source = match source.as_ref() {
@@ -204,11 +205,15 @@ impl Shared {
 
             let mut interest = source.interest.lock().expect("event loop");
 
-            if event.is_readable() && !event.is_read_closed() {
+            // TODO why is EPOLLRDHUP sent sometimes?
+            // if event.is_readable() && !event.is_read_closed() {
+            if event.is_readable() {
                 // TODO when is this waker None?
                 if let Some(waker) = interest[Direction::Read as usize].take() {
                     wakers.push(waker);
                 }
+
+                // wakers.push(crate::executor::waker_for(queue_index));
 
                 // TODO why release?
                 source.triggered[Direction::Read as usize].store(true, Ordering::Release);
@@ -219,6 +224,8 @@ impl Shared {
                 if let Some(waker) = interest[Direction::Write as usize].take() {
                     wakers.push(waker);
                 }
+
+                // wakers.push(crate::executor::waker_for(queue_index));
 
                 // TODO why release?
                 source.triggered[Direction::Write as usize].store(true, Ordering::Release);
