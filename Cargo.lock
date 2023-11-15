@@ -210,6 +210,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-body-util"
+version = "0.1.0-rc.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ef12f041acdd397010e5fb6433270c147d3b8b2d0a840cd7fff8e531dca5c8"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "httparse"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -239,6 +252,24 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tracing",
+ "want",
+]
+
+[[package]]
+name = "hyper"
+version = "1.0.0-rc.4"
+source = "git+https://github.com/hyperium/hyper#6fd696e10974f10b2c6b9d16393bbbfa21c2333f"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-util",
+ "h2",
+ "http",
+ "http-body",
+ "httparse",
+ "itoa",
+ "pin-project-lite",
+ "tokio",
  "want",
 ]
 
@@ -356,7 +387,8 @@ version = "0.1.0"
 dependencies = [
  "atomic-wait",
  "cc",
- "hyper",
+ "http-body-util",
+ "hyper 1.0.0-rc.4 (git+https://github.com/hyperium/hyper)",
  "log 0.1.0",
  "mio",
  "roc_app",
@@ -488,7 +520,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "atomic-wait",
- "hyper",
+ "hyper 1.0.0-rc.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.1.0",
  "mio",
  "serde",

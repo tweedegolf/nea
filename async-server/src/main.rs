@@ -178,7 +178,7 @@ fn main() -> std::io::Result<()> {
     let reactor = Reactor::get_or_init(config.bucket_count, config.io_resources).unwrap();
 
     let _handle1 = executor.spawn_worker().unwrap();
-    let _handle2 = executor.spawn_worker().unwrap();
+    // let _handle2 = executor.spawn_worker().unwrap();
     // let _handle3 = executor.spawn_worker().unwrap();
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -322,7 +322,7 @@ async fn hyper_app(
     let input = &buffer[..n];
     let input = std::str::from_utf8(input).unwrap();
 
-    let url = "https://github.com/hyperium/hyper/blob/master/examples/client.rs"
+    let url = "http://0.0.0.0:8000/build.rs"
         .parse::<hyper::Uri>()
         .unwrap();
     let host = url.host().expect("uri has no host");
@@ -346,11 +346,18 @@ async fn hyper_app(
 
     log::info!("built request");
 
-    let res = sender.send_request(req).await.unwrap();
+    let mut res = sender.send_request(req).await.unwrap();
     log::info!("sent request");
 
     // Stream the body, writing each frame to stdout as it arrives
-    res.into_body();
+    use http_body_util::BodyExt;
+    while let Some(next) = res.frame().await {
+        let frame = next.unwrap();
+    }
+
+    let x = res.collect().await;
+    // std::mem::forget(res);
+    log::info!("into body");
 
     let mut buffer = [0u8; 1024];
     let mut response = Cursor::new(&mut buffer[..]);

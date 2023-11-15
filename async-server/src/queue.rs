@@ -136,9 +136,15 @@ impl Refcount2 {
     }
 
     fn wait_active(&self) -> u32 {
+        let thread = thread::current().id();
         let mut guard = self.active_mutex.lock().unwrap();
-        while *guard == 0 {
-            guard = self.active_condvar.wait(guard).unwrap();
+
+        if *guard == 0 {
+            log::warn!("{thread:?}: 😴");
+
+            while *guard == 0 {
+                guard = self.active_condvar.wait(guard).unwrap();
+            }
         }
 
         *guard
@@ -316,8 +322,6 @@ impl ComplexQueue {
         let thread = thread::current().id();
 
         loop {
-            log::warn!("{thread:?}: 😴");
-
             let n = self.wait_jobs_available();
             log::warn!("{thread:?}: ⚙️  done waiting, {n} jobs available");
 

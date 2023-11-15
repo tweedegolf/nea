@@ -5,7 +5,10 @@ use std::{
     future::Future,
     ops::DerefMut,
     pin::Pin,
-    sync::{atomic::Ordering, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+    },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
@@ -17,7 +20,12 @@ use crate::{
     reactor, ARENA_INDEX_EXECUTOR,
 };
 
-const RAW_WAKER_V_TABLE: RawWakerVTable = {
+pub(crate) fn waker_for(queue_index: QueueIndex) -> Waker {
+    let raw_waker = std::task::RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
+    unsafe { Waker::from_raw(raw_waker) }
+}
+
+pub(crate) const RAW_WAKER_V_TABLE: RawWakerVTable = {
     fn clone_raw(ptr: *const ()) -> RawWaker {
         RawWaker::new(ptr, &RAW_WAKER_V_TABLE)
     }
@@ -36,6 +44,14 @@ const RAW_WAKER_V_TABLE: RawWakerVTable = {
         let index = QueueIndex::from_ptr(ptr);
         log::warn!("{thread:?}: wake {}", index.index);
 
+        if index.index == 0 {
+            static X: AtomicUsize = AtomicUsize::new(0);
+
+            let old = X.fetch_add(1, Ordering::Relaxed);
+
+            if old == 1 {}
+        }
+
         // NOTE: the unit here is a lie! we just don't know the correct type for the future here
         let executor = Executor::<()>::get().unwrap();
 
@@ -52,6 +68,8 @@ const RAW_WAKER_V_TABLE: RawWakerVTable = {
 pub struct Executor<F: 'static> {
     inner: &'static Inner<F>,
 }
+
+type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
 
 type Http2Connection =
     hyper::client::conn::http2::Connection<reactor::TcpStream, String, HyperExecutor>;
@@ -124,7 +142,7 @@ struct Inner<F> {
     /// number of active queue slots for each bucket
     refcounts: Box<[Mutex<u8>]>,
     futures: Box<[Mutex<Option<F>>]>,
-    connections: Box<[Mutex<Option<Http2Connection>>]>,
+    connections: Box<[Mutex<Slot<Http1Connection>>]>,
     http2_futures: Box<[Mutex<Option<PinBoxFuture>>]>,
     queue: crate::queue::ComplexQueue,
 }
@@ -150,7 +168,7 @@ where
                     .collect();
 
                 let connection_count = bucket_count * io_resources.http_connections;
-                let connections = std::iter::repeat_with(|| Mutex::new(None))
+                let connections = std::iter::repeat_with(|| Mutex::new(Slot::Empty))
                     .take(connection_count)
                     .collect();
 
@@ -211,6 +229,13 @@ where
     }
 }
 
+enum Slot<T> {
+    Empty,
+    Reserved,
+    Occupied(T),
+    Spent,
+}
+
 impl<F> Executor<F> {
     pub fn get() -> Option<Self> {
         let inner: &&() = INNER.get()?;
@@ -226,14 +251,12 @@ impl<F> Executor<F> {
         bucket_index: BucketIndex,
         host: &str,
         port: u16,
-    ) -> std::io::Result<hyper::client::conn::http2::SendRequest<String>> {
+    ) -> std::io::Result<hyper::client::conn::http1::SendRequest<String>> {
         let stream = std::net::TcpStream::connect(format!("{}:{}", host, port)).unwrap();
         stream.set_nonblocking(true)?;
 
         let indices = self.inner.io_resources.http_connections(bucket_index);
         let connection_index = indices.start;
-
-        let mut opt_connection_offset = None;
 
         {
             let mut bucket_guard = self.inner.refcounts[bucket_index.index as usize]
@@ -251,19 +274,25 @@ impl<F> Executor<F> {
             drop(bucket_guard);
         }
 
-        for (i, slot) in self.inner.connections[indices].iter().enumerate() {
-            let Ok(mut slot) = slot.try_lock() else {
-                continue;
-            };
+        let opt_connection_offset = 'blk: {
+            for (i, slot) in self.inner.connections[indices].iter().enumerate() {
+                let Ok(mut slot) = slot.try_lock() else {
+                    continue;
+                };
 
-            match slot.deref_mut() {
-                None => *slot = None,
-                Some(_) => continue,
+                match slot.deref_mut() {
+                    Slot::Reserved | Slot::Occupied(_) | Slot::Spent => {
+                        continue;
+                    }
+                    Slot::Empty => {
+                        *slot = Slot::Reserved;
+                        break 'blk Some(i);
+                    }
+                }
             }
 
-            opt_connection_offset = Some(i);
-            break;
-        }
+            None
+        };
 
         let Some(i) = opt_connection_offset else {
             todo!("no free connection slot for bucket {}", bucket_index.index);
@@ -280,15 +309,20 @@ impl<F> Executor<F> {
             QueueIndex::from_connection_index(self.inner.io_resources, connection_index);
         let stream = reactor.register(queue_index, stream).unwrap();
 
-        // let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
         let hyper_executor = HyperExecutor { bucket_index };
-        let (sender, conn) = hyper::client::conn::http2::handshake(hyper_executor, stream)
-            .await
+        let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+
+        let mut connection_lock = self.inner.connections[connection_index.index as usize]
+            .try_lock()
             .unwrap();
 
-        *self.inner.connections[connection_index.index as usize]
-            .try_lock()
-            .unwrap() = Some(conn);
+        assert!(matches!(*connection_lock, Slot::Reserved));
+        *connection_lock = Slot::Occupied(conn);
+
+        let thread = std::thread::current().id();
+        log::info!("{thread:?}: connection {} populated", queue_index.index);
+
+        drop(connection_lock);
 
         if self.inner.queue.enqueue(queue_index).is_err() {
             log::warn!("connection cannot be started because the queue is full! ");
@@ -340,7 +374,7 @@ where
                             bucket_guard.saturating_sub(1),
                         );
 
-                        assert!(*bucket_guard != 0);
+                        // assert!(*bucket_guard != 0);
 
                         if *bucket_guard == 1 {
                             // clear the memory
@@ -389,14 +423,13 @@ where
             .unwrap();
 
         let fut = match task_mut.as_mut() {
-            None => panic!("race condition"),
+            None => panic!("input stream race condition"),
             Some(inner) => inner,
         };
 
         let pinned = unsafe { Pin::new_unchecked(fut) };
 
-        let raw_waker = RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let waker = waker_for(queue_index);
         let mut cx = Context::from_waker(&waker);
 
         // early return if pending
@@ -414,26 +447,36 @@ where
         queue_index: QueueIndex,
         connection_index: ConnectionIndex,
     ) -> Poll<()> {
+        let thread = std::thread::current().id();
+
         let mut task_mut = self.connections[connection_index.index as usize]
             .lock()
             .unwrap();
 
-        let Some(connection) = task_mut.deref_mut() else {
-            panic!("race condition")
+        let connection = match task_mut.deref_mut() {
+            Slot::Empty => panic!("{thread:?}: race condition empty"),
+            Slot::Reserved => panic!("{thread:?}: race condition reserved"),
+            Slot::Occupied(connection) => connection,
+            slot @ Slot::Spent => {
+                *slot = Slot::Empty;
+                return Poll::Ready(());
+            }
         };
 
         let pinned = unsafe { Pin::new_unchecked(connection) };
 
-        let raw_waker = RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let waker = waker_for(queue_index);
         let mut cx = Context::from_waker(&waker);
 
         // early return if pending
         let result = std::task::ready!(pinned.poll(&mut cx));
 
-        let Some(connection) = task_mut.take() else {
+        let Slot::Occupied(connection) = std::mem::replace(task_mut.deref_mut(), Slot::Spent)
+        else {
             panic!("no connection");
         };
+
+        log::info!("{thread:?}: {} cleared", queue_index.index);
 
         // only stores PhandomData<TcpStream>. the actual stream is not in here
         drop(connection);
@@ -442,7 +485,7 @@ where
             log::warn!("error in http connection {e:?}");
         }
 
-        Poll::Ready(())
+        Poll::Pending
     }
 
     fn poll_http2_future(
@@ -463,8 +506,7 @@ where
             return Poll::Ready(());
         };
 
-        let raw_waker = RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
-        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let waker = waker_for(queue_index);
         let mut cx = Context::from_waker(&waker);
 
         // early return when pending
