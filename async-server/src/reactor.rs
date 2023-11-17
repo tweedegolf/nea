@@ -205,8 +205,6 @@ impl Shared {
 
             let mut interest = source.interest.lock().expect("event loop");
 
-            // TODO why is EPOLLRDHUP sent sometimes?
-            // if event.is_readable() && !event.is_read_closed() {
             if event.is_readable() {
                 // TODO when is this waker None?
                 if let Some(waker) = interest[Direction::Read as usize].take() {
@@ -219,7 +217,7 @@ impl Shared {
                 source.triggered[Direction::Read as usize].store(true, Ordering::Release);
             }
 
-            if event.is_writable() && !event.is_write_closed() {
+            if event.is_writable() {
                 // TODO when is this waker None?
                 if let Some(waker) = interest[Direction::Write as usize].take() {
                     wakers.push(waker);

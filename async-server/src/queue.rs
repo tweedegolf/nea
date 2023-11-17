@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use crate::executor::QueueIndex;
 const ENQUEUED_BIT: u8 = 0b0001;
 const IN_PROGRESS_BIT: u8 = 0b0010;
 
+#[derive(Debug)]
 pub struct QueueSlotState {
     pub is_enqueued: bool,
     pub is_in_progress: bool,
@@ -231,6 +233,16 @@ impl ComplexQueue {
         self.jobs_in_queue.wait_active()
     }
 
+    pub fn is_range_empty(&self, range: Range<QueueIndex>) -> bool {
+        for slot in &self.queue[range.start.index as usize..range.end.index as usize] {
+            if !slot.is_empty() {
+                return false;
+            }
+        }
+
+        true
+    }
+
     pub fn enqueue(&self, index: QueueIndex) -> Result<(), QueueIndex> {
         let thread = thread::current().id();
 
@@ -240,12 +252,15 @@ impl ComplexQueue {
 
         // eagerly increment (but don't wake anyone yet). This is to prevent race conditions
         // between marking the slot as enqueued and updating the count of enqueued slots.
-        let _jobs_available = self.increment_jobs_available();
+        let jobs_available = self.increment_jobs_available();
 
         let old_slot_state = current.mark_enqueued();
 
         if !old_slot_state.is_enqueued && !old_slot_state.is_in_progress {
-            log::warn!("{thread:?}: ☀️  job {} is new in the queue", index.index);
+            log::warn!(
+                "{thread:?}: ☀️  job {} is new in the queue ({jobs_available} jobs available)",
+                index.index
+            );
 
             // this is a new job, notify a worker
             self.jobs_in_queue.wake_one();
@@ -254,10 +269,9 @@ impl ComplexQueue {
             self.decrement_jobs_available();
 
             log::warn!(
-                "{thread:?}: ++++++++++ job {} was already in the queue ({}, {})",
+                "{thread:?}: job {} was already in the queue ({old_slot_state:?}, {} jobs  available)",
                 index.index,
-                format_args!("ENQUEUED_BIT: {}", old_slot_state.is_enqueued),
-                format_args!("IN_PROGRESS_BIT: {}", old_slot_state.is_in_progress),
+                jobs_available - 1,
             );
         }
 
@@ -266,19 +280,34 @@ impl ComplexQueue {
 
     #[must_use]
     pub fn done_with_item(&self, queue_slot: &QueueSlot) -> DoneWithItem {
-        let old_slot_state = queue_slot.clear_enqueued();
+        for _ in 0..10 {
+            let enqueued_while_in_progress = queue_slot.0.compare_exchange(
+                ENQUEUED_BIT | IN_PROGRESS_BIT,
+                IN_PROGRESS_BIT,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            );
 
-        assert!(old_slot_state.is_in_progress);
+            let Err(state) = enqueued_while_in_progress else {
+                return DoneWithItem::GoAgain;
+            };
 
-        if old_slot_state.is_enqueued {
-            // slot got enqueued while processing; process it again
-            DoneWithItem::GoAgain
-        } else {
-            // let old_value = current.fetch_and(!IN_PROGRESS_BIT, Ordering::Relaxed);
-            // assert!(old_value & IN_PROGRESS_BIT != 0);
+            assert_eq!(state, IN_PROGRESS_BIT);
 
-            DoneWithItem::Done
+            let clear_in_progress = queue_slot.0.compare_exchange(
+                IN_PROGRESS_BIT,
+                0,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            );
+
+            match clear_in_progress {
+                Err(_) => continue,
+                Ok(_) => return DoneWithItem::Done,
+            }
         }
+
+        unreachable!("could not clear in progress state")
     }
 
     fn try_dequeue(&self) -> Option<(QueueIndex, &QueueSlot)> {
