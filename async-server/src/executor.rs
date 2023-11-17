@@ -44,14 +44,6 @@ pub(crate) const RAW_WAKER_V_TABLE: RawWakerVTable = {
         let index = QueueIndex::from_ptr(ptr);
         log::warn!("{thread:?}: wake {}", index.index);
 
-        if index.index == 0 {
-            static X: AtomicUsize = AtomicUsize::new(0);
-
-            let old = X.fetch_add(1, Ordering::Relaxed);
-
-            if old == 1 {}
-        }
-
         // NOTE: the unit here is a lie! we just don't know the correct type for the future here
         let executor = Executor::<()>::get().unwrap();
 
@@ -218,10 +210,15 @@ where
         self.inner.try_claim()
     }
 
-    pub fn execute(&self, index: BucketIndex, fut: F) {
-        self.inner.set(index, fut);
+    pub fn execute(&self, bucket_index: BucketIndex, fut: F) {
+        eprintln!("------------------------");
+        self.inner.set(bucket_index, fut);
 
-        let queue_index = QueueIndex::from_bucket_index(self.inner.io_resources, index);
+        let queue_index = QueueIndex::from_bucket_index(self.inner.io_resources, bucket_index);
+
+        let range = self.inner.io_resources.queue_slots(bucket_index);
+        assert!(self.inner.queue.is_range_empty(range));
+
         match self.inner.queue.enqueue(queue_index) {
             Ok(()) => (),
             Err(_) => unreachable!("we claimed a spot!"),
@@ -388,24 +385,14 @@ where
                         } else {
                             *bucket_guard -= 1;
 
-                            let old_slot_state = queue_slot.clear_in_progress();
-
-                            // this slot is done, so should not be enqueued by anyone
-                            // however it looks like tasks can enqueue themselves?
-                            queue_slot.clear_enqueued();
-
-                            //                            assert!(
-                            //                                !old_slot_state.is_enqueued,
-                            //                                "{thread:?}: job {} {io_index:?} is enqueued but also done",
-                            //                                queue_index.index
-                            //                            );
+                            // even if the task is enqueue'd again, there is nothing to do
+                            queue_slot.mark_empty();
 
                             continue 'outer;
                         }
                     }
                     Poll::Pending => match self.queue.done_with_item(queue_slot) {
                         DoneWithItem::Done => {
-                            queue_slot.clear_in_progress();
                             continue 'outer;
                         }
                         DoneWithItem::GoAgain => {
@@ -438,6 +425,8 @@ where
         // this future is now done
         let old = task_mut.take();
         assert!(old.is_some());
+
+        eprintln!("input stream should die");
 
         Poll::Ready(())
     }

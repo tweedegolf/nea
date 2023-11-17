@@ -178,7 +178,7 @@ fn main() -> std::io::Result<()> {
     let reactor = Reactor::get_or_init(config.bucket_count, config.io_resources).unwrap();
 
     let _handle1 = executor.spawn_worker().unwrap();
-    // let _handle2 = executor.spawn_worker().unwrap();
+    let _handle2 = executor.spawn_worker().unwrap();
     // let _handle3 = executor.spawn_worker().unwrap();
 
     let addr = format!("{}:{}", config.host, config.port);
