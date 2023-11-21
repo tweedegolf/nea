@@ -6,8 +6,8 @@ use std::{
     ops::DerefMut,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex, OnceLock,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Mutex, MutexGuard, OnceLock,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
@@ -47,9 +47,7 @@ pub(crate) const RAW_WAKER_V_TABLE: RawWakerVTable = {
         // NOTE: the unit here is a lie! we just don't know the correct type for the future here
         let executor = Executor::<()>::get().unwrap();
 
-        if executor.inner.queue.enqueue(index).is_err() {
-            log::warn!("task cannot be woken because the queue is full! ");
-        }
+        executor.inner.queue.wake(index);
 
         log::warn!("{thread:?}: woke {}", index.index);
     }
@@ -120,9 +118,7 @@ where
         let queue_index =
             QueueIndex::from_http2_future_index(executor.inner.io_resources, http2_future_index);
 
-        if executor.inner.queue.enqueue(queue_index).is_err() {
-            log::warn!("connection cannot be started because the queue is full! ");
-        }
+        executor.inner.queue.enqueue(queue_index);
     }
 }
 
@@ -211,7 +207,6 @@ where
     }
 
     pub fn execute(&self, bucket_index: BucketIndex, fut: F) {
-        eprintln!("------------------------");
         self.inner.set(bucket_index, fut);
 
         let queue_index = QueueIndex::from_bucket_index(self.inner.io_resources, bucket_index);
@@ -219,10 +214,7 @@ where
         let range = self.inner.io_resources.queue_slots(bucket_index);
         assert!(self.inner.queue.is_range_empty(range));
 
-        match self.inner.queue.enqueue(queue_index) {
-            Ok(()) => (),
-            Err(_) => unreachable!("we claimed a spot!"),
-        }
+        self.inner.queue.enqueue(queue_index);
     }
 }
 
@@ -230,7 +222,6 @@ enum Slot<T> {
     Empty,
     Reserved,
     Occupied(T),
-    Spent,
 }
 
 impl<F> Executor<F> {
@@ -278,7 +269,7 @@ impl<F> Executor<F> {
                 };
 
                 match slot.deref_mut() {
-                    Slot::Reserved | Slot::Occupied(_) | Slot::Spent => {
+                    Slot::Reserved | Slot::Occupied(_) => {
                         continue;
                     }
                     Slot::Empty => {
@@ -295,8 +286,12 @@ impl<F> Executor<F> {
             todo!("no free connection slot for bucket {}", bucket_index.index);
         };
 
+        static CONNECTION_IDENTIFIER: AtomicU32 = AtomicU32::new(0);
+
+        let identifier = CONNECTION_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
+
         let connection_index = ConnectionIndex {
-            identifier: bucket_index.identifier,
+            identifier,
             index: (connection_index + i) as u32,
         };
 
@@ -321,9 +316,7 @@ impl<F> Executor<F> {
 
         drop(connection_lock);
 
-        if self.inner.queue.enqueue(queue_index).is_err() {
-            log::warn!("connection cannot be started because the queue is full! ");
-        }
+        self.inner.queue.enqueue(queue_index);
 
         Ok(sender)
     }
@@ -350,7 +343,17 @@ where
                     }
                     IoIndex::CustomStream(_) => todo!(),
                     IoIndex::HttpConnection(connection_index) => {
-                        self.poll_http_connection(queue_index, connection_index)
+                        match self.poll_http_connection(queue_index, connection_index) {
+                            Some(poll) => poll,
+                            None => match self.queue.done_with_item(queue_slot) {
+                                DoneWithItem::Done => {
+                                    continue 'outer;
+                                }
+                                DoneWithItem::GoAgain => {
+                                    continue 'enqueued_while_processing;
+                                }
+                            },
+                        }
                     }
                     IoIndex::Http2Future(future_index) => {
                         self.poll_http2_future(queue_index, future_index)
@@ -365,6 +368,11 @@ where
                         let mut bucket_guard =
                             self.refcounts[bucket_index.index as usize].lock().unwrap();
 
+                        // this slot is now done (until we put a new connection into it). To
+                        // prevent hyper from waking it again (it will do that), invalidate the
+                        // identifier so that the `wake` function on queue will always reject it
+                        queue_slot.id.fetch_sub(1, Ordering::Relaxed);
+
                         log::warn!(
                             "💀 job {} (rc now {})",
                             queue_index.index,
@@ -377,9 +385,9 @@ where
                             // clear the memory
                             // ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
 
-                            queue_slot.mark_empty();
-
                             *bucket_guard = 0;
+
+                            queue_slot.mark_empty();
 
                             continue 'outer;
                         } else {
@@ -426,8 +434,6 @@ where
         let old = task_mut.take();
         assert!(old.is_some());
 
-        eprintln!("input stream should die");
-
         Poll::Ready(())
     }
 
@@ -435,7 +441,7 @@ where
         &self,
         queue_index: QueueIndex,
         connection_index: ConnectionIndex,
-    ) -> Poll<()> {
+    ) -> Option<Poll<()>> {
         let thread = std::thread::current().id();
 
         let mut task_mut = self.connections[connection_index.index as usize]
@@ -443,13 +449,9 @@ where
             .unwrap();
 
         let connection = match task_mut.deref_mut() {
-            Slot::Empty => panic!("{thread:?}: race condition empty"),
+            Slot::Empty => return None,
             Slot::Reserved => panic!("{thread:?}: race condition reserved"),
             Slot::Occupied(connection) => connection,
-            slot @ Slot::Spent => {
-                *slot = Slot::Empty;
-                return Poll::Ready(());
-            }
         };
 
         let pinned = unsafe { Pin::new_unchecked(connection) };
@@ -458,9 +460,12 @@ where
         let mut cx = Context::from_waker(&waker);
 
         // early return if pending
-        let result = std::task::ready!(pinned.poll(&mut cx));
+        let result = match pinned.poll(&mut cx) {
+            Poll::Ready(x) => x,
+            Poll::Pending => return Some(Poll::Pending),
+        };
 
-        let Slot::Occupied(connection) = std::mem::replace(task_mut.deref_mut(), Slot::Spent)
+        let Slot::Occupied(connection) = std::mem::replace(task_mut.deref_mut(), Slot::Empty)
         else {
             panic!("no connection");
         };
@@ -474,7 +479,7 @@ where
             log::warn!("error in http connection {e:?}");
         }
 
-        Poll::Pending
+        Some(Poll::Ready(()))
     }
 
     fn poll_http2_future(

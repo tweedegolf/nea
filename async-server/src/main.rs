@@ -104,13 +104,32 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
     }
 }
 
+struct LoggingAlloc(std::alloc::System);
+
+unsafe impl std::alloc::GlobalAlloc for LoggingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() > 1_000_000_000 {
+            dbg!(std::backtrace::Backtrace::force_capture());
+        }
+
+        self.0.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        self.0.dealloc(ptr, layout)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: LoggingAlloc = LoggingAlloc(std::alloc::System);
+
+// #[global_allocator]
+// static ALLOCATOR: ServerAlloc = ServerAlloc(shared::allocator::ServerAlloc::new());
+
 /// Global Allocator for the Server
 ///
 /// This is where the magic happens
 struct ServerAlloc(shared::allocator::ServerAlloc);
-
-// #[global_allocator]
-// static ALLOCATOR: ServerAlloc = ServerAlloc(shared::allocator::ServerAlloc::new());
 
 unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
@@ -355,7 +374,8 @@ async fn hyper_app(
         let frame = next.unwrap();
     }
 
-    let x = res.collect().await;
+    // std::mem::forget(res);
+
     // std::mem::forget(res);
     log::info!("into body");
 
