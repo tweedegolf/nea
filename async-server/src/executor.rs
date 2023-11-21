@@ -343,16 +343,15 @@ where
                     }
                     IoIndex::CustomStream(_) => todo!(),
                     IoIndex::HttpConnection(connection_index) => {
+                        // destructors in the main future (polled by poll_input_stream) can cause
+                        // a wake of this task. But often this task is already complete, and there
+                        // is nothing sensible to do.
                         match self.poll_http_connection(queue_index, connection_index) {
                             Some(poll) => poll,
-                            None => match self.queue.done_with_item(queue_slot) {
-                                NextStep::Done => {
-                                    continue 'outer;
-                                }
-                                NextStep::GoAgain => {
-                                    continue 'enqueued_while_processing;
-                                }
-                            },
+                            None => {
+                                let _ = self.queue.done_with_item(queue_slot);
+                                continue 'outer;
+                            }
                         }
                     }
                     IoIndex::Http2Future(future_index) => {
