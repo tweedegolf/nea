@@ -322,6 +322,13 @@ impl<F> Executor<F> {
     }
 }
 
+enum HyperWake {
+    /// The task is now finished
+    Legit,
+    /// This task is already done
+    AfterDeath,
+}
+
 impl<F> Inner<F>
 where
     F: Future<Output = ()> + Send,
@@ -343,15 +350,16 @@ where
                     }
                     IoIndex::CustomStream(_) => todo!(),
                     IoIndex::HttpConnection(connection_index) => {
-                        // destructors in the main future (polled by poll_input_stream) can cause
-                        // a wake of this task. But often this task is already complete, and there
-                        // is nothing sensible to do.
                         match self.poll_http_connection(queue_index, connection_index) {
-                            Some(poll) => poll,
-                            None => {
+                            Poll::Ready(HyperWake::Legit) => Poll::Ready(()),
+                            Poll::Ready(HyperWake::AfterDeath) => {
+                                // destructors in the main future (polled by poll_input_stream) can cause
+                                // a wake of this task. But often this task is already complete, and there
+                                // is nothing sensible to do.
                                 let _ = self.queue.done_with_item(queue_slot);
                                 continue 'outer;
                             }
+                            Poll::Pending => Poll::Pending,
                         }
                     }
                     IoIndex::Http2Future(future_index) => {
@@ -440,7 +448,7 @@ where
         &self,
         queue_index: QueueIndex,
         connection_index: ConnectionIndex,
-    ) -> Option<Poll<()>> {
+    ) -> Poll<HyperWake> {
         let thread = std::thread::current().id();
 
         let mut task_mut = self.connections[connection_index.index as usize]
@@ -449,7 +457,7 @@ where
 
         // for some reason, Hyper wakes tasks that are already already complete. We can't have that!
         let connection = match task_mut.deref_mut() {
-            Slot::Empty => return None,
+            Slot::Empty => return Poll::Ready(HyperWake::AfterDeath),
             Slot::Reserved => panic!("{thread:?}: race condition reserved"),
             Slot::Occupied(connection) => connection,
         };
@@ -459,9 +467,7 @@ where
         let mut cx = Context::from_waker(&waker);
 
         // early return if pending
-        let Poll::Ready(result) = pinned.poll(&mut cx) else {
-            return Some(Poll::Pending);
-        };
+        let result = std::task::ready!(pinned.poll(&mut cx));
 
         let Slot::Occupied(connection) = std::mem::replace(task_mut.deref_mut(), Slot::Empty)
         else {
@@ -477,7 +483,7 @@ where
             log::warn!("error in http connection {e:?}");
         }
 
-        Some(Poll::Ready(()))
+        Poll::Ready(HyperWake::Legit)
     }
 
     fn poll_http2_future(
