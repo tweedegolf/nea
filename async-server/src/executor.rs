@@ -6,8 +6,8 @@ use std::{
     ops::DerefMut,
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
-        Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicU32, Ordering},
+        Mutex, OnceLock,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
@@ -15,7 +15,7 @@ use std::{
 pub use crate::index::{BucketIndex, ConnectionIndex, Http2FutureIndex, IoIndex, QueueIndex};
 use crate::{
     index::IoResources,
-    queue::{ComplexQueue, DoneWithItem},
+    queue::{ComplexQueue, NextStep},
     reactor, ARENA_INDEX_EXECUTOR,
 };
 use crate::{ALLOCATOR, CURRENT_ARENA};
@@ -118,7 +118,7 @@ where
         let queue_index =
             QueueIndex::from_http2_future_index(executor.inner.io_resources, http2_future_index);
 
-        executor.inner.queue.enqueue(queue_index);
+        executor.inner.queue.initial_enqueue(queue_index);
     }
 }
 
@@ -214,7 +214,7 @@ where
         let range = self.inner.io_resources.queue_slots(bucket_index);
         assert!(self.inner.queue.is_range_empty(range));
 
-        self.inner.queue.enqueue(queue_index);
+        self.inner.queue.initial_enqueue(queue_index);
     }
 }
 
@@ -316,7 +316,7 @@ impl<F> Executor<F> {
 
         drop(connection_lock);
 
-        self.inner.queue.enqueue(queue_index);
+        self.inner.queue.initial_enqueue(queue_index);
 
         Ok(sender)
     }
@@ -346,10 +346,10 @@ where
                         match self.poll_http_connection(queue_index, connection_index) {
                             Some(poll) => poll,
                             None => match self.queue.done_with_item(queue_slot) {
-                                DoneWithItem::Done => {
+                                NextStep::Done => {
                                     continue 'outer;
                                 }
-                                DoneWithItem::GoAgain => {
+                                NextStep::GoAgain => {
                                     continue 'enqueued_while_processing;
                                 }
                             },
@@ -400,10 +400,10 @@ where
                         }
                     }
                     Poll::Pending => match self.queue.done_with_item(queue_slot) {
-                        DoneWithItem::Done => {
+                        NextStep::Done => {
                             continue 'outer;
                         }
-                        DoneWithItem::GoAgain => {
+                        NextStep::GoAgain => {
                             continue 'enqueued_while_processing;
                         }
                     },
@@ -448,6 +448,7 @@ where
             .lock()
             .unwrap();
 
+        // for some reason, Hyper wakes tasks that are already already complete. We can't have that!
         let connection = match task_mut.deref_mut() {
             Slot::Empty => return None,
             Slot::Reserved => panic!("{thread:?}: race condition reserved"),
@@ -455,14 +456,12 @@ where
         };
 
         let pinned = unsafe { Pin::new_unchecked(connection) };
-
         let waker = waker_for(queue_index);
         let mut cx = Context::from_waker(&waker);
 
         // early return if pending
-        let result = match pinned.poll(&mut cx) {
-            Poll::Ready(x) => x,
-            Poll::Pending => return Some(Poll::Pending),
+        let Poll::Ready(result) = pinned.poll(&mut cx) else {
+            return Some(Poll::Pending);
         };
 
         let Slot::Occupied(connection) = std::mem::replace(task_mut.deref_mut(), Slot::Empty)
@@ -518,8 +517,6 @@ where
 
         // this _should_ close the underlying TCP stream
         std::mem::drop(fut);
-
-        // log::error!("{thread:?}: {} done", queue_index.index);
 
         Poll::Ready(())
     }
