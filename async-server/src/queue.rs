@@ -159,51 +159,11 @@ impl Refcount2 {
     }
 }
 
-struct Refcount1 {
-    rc: AtomicU32,
-}
-
-impl Refcount1 {
-    fn new() -> Self {
-        Self {
-            rc: AtomicU32::new(0),
-        }
-    }
-
-    fn increment_active(&self) {
-        let old = self.rc.fetch_add(1, Ordering::SeqCst);
-
-        if let None = old.checked_add(1) {
-            let thread = thread::current().id();
-            eprintln!("{thread:?}: RC does not overflow");
-            panic!();
-        }
-    }
-
-    fn wake_one(&self) {
-        atomic_wait::wake_one(&self.rc);
-    }
-
-    fn decrement_active(&self) {
-        let old = self.rc.fetch_sub(1, Ordering::SeqCst);
-
-        if let None = old.checked_sub(1) {
-            let thread = thread::current().id();
-            eprintln!("{thread:?}: RC does not underflow");
-            panic!();
-        }
-    }
-
-    fn wait_active(&self) {
-        while self.rc.load(Ordering::Relaxed) == 0 {
-            atomic_wait::wait(&self.rc, 0);
-        }
-    }
-}
-
 #[derive(Debug)]
-pub enum DoneWithItem {
+pub enum NextStep {
+    /// The element is no longer in the queue
     Done,
+    /// The element was enqueued again while it was processed
     GoAgain,
 }
 
@@ -217,10 +177,6 @@ impl ComplexQueue {
             queue,
             jobs_in_queue: Refcount2::new(),
         }
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.queue.len()
     }
 
     fn increment_jobs_available(&self) -> u32 {
@@ -249,6 +205,7 @@ impl ComplexQueue {
         true
     }
 
+    /// Wake an existing task by putting it back into the queue
     pub fn wake(&self, index: QueueIndex) {
         let thread = thread::current().id();
 
@@ -290,7 +247,8 @@ impl ComplexQueue {
         }
     }
 
-    pub fn enqueue(&self, index: QueueIndex) {
+    /// The first enqueue of a task. Must NOT be used to wake an existing task!
+    pub fn initial_enqueue(&self, index: QueueIndex) {
         let thread = thread::current().id();
 
         let Some(current) = self.queue.get(index.index as usize) else {
@@ -327,8 +285,9 @@ impl ComplexQueue {
     }
 
     #[must_use]
-    pub fn done_with_item(&self, queue_slot: &QueueSlot) -> DoneWithItem {
-        for _ in 0..10 {
+    pub fn done_with_item(&self, queue_slot: &QueueSlot) -> NextStep {
+        // in theory you can be unlucky and have the clear progress step fail.
+        for _ in std::iter::repeat(()).take(2) {
             let enqueued_while_in_progress = queue_slot.flags.compare_exchange(
                 ENQUEUED_BIT | IN_PROGRESS_BIT,
                 IN_PROGRESS_BIT,
@@ -337,7 +296,7 @@ impl ComplexQueue {
             );
 
             let Err(state) = enqueued_while_in_progress else {
-                return DoneWithItem::GoAgain;
+                return NextStep::GoAgain;
             };
 
             assert_eq!(state, IN_PROGRESS_BIT);
@@ -351,7 +310,7 @@ impl ComplexQueue {
 
             match clear_in_progress {
                 Err(_) => continue,
-                Ok(_) => return DoneWithItem::Done,
+                Ok(_) => return NextStep::Done,
             }
         }
 
