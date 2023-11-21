@@ -13,12 +13,12 @@ use std::{
 };
 
 pub use crate::index::{BucketIndex, ConnectionIndex, Http2FutureIndex, IoIndex, QueueIndex};
-use crate::CURRENT_ARENA;
 use crate::{
     index::IoResources,
     queue::{ComplexQueue, DoneWithItem},
     reactor, ARENA_INDEX_EXECUTOR,
 };
+use crate::{ALLOCATOR, CURRENT_ARENA};
 
 pub(crate) fn waker_for(queue_index: QueueIndex) -> Waker {
     let raw_waker = std::task::RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
@@ -383,7 +383,7 @@ where
 
                         if *bucket_guard == 1 {
                             // clear the memory
-                            // ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
+                            ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
 
                             *bucket_guard = 0;
 

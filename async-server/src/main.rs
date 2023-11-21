@@ -85,16 +85,7 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
 
     eprintln!("arena {bucket_index}: allocating {size} bytes",);
 
-    //    match ALLOCATOR.0.try_allocate_in_bucket(layout, bucket_index) {
-    //        None => {
-    //            let msg = b"out of memory\0";
-    //            let panic_tag = 1;
-    //            roc_panic(msg.map(|x| x as std::ffi::c_char).as_ptr(), panic_tag)
-    //        }
-    //        Some(non_null) => non_null,
-    //    }
-
-    match NonNull::new(std::alloc::alloc(layout)) {
+    match ALLOCATOR.0.try_allocate_in_bucket(layout, bucket_index) {
         None => {
             let msg = b"out of memory\0";
             let panic_tag = 1;
@@ -104,27 +95,8 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
     }
 }
 
-struct LoggingAlloc(std::alloc::System);
-
-unsafe impl std::alloc::GlobalAlloc for LoggingAlloc {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if layout.size() > 1_000_000_000 {
-            dbg!(std::backtrace::Backtrace::force_capture());
-        }
-
-        self.0.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        self.0.dealloc(ptr, layout)
-    }
-}
-
 #[global_allocator]
-static ALLOCATOR: LoggingAlloc = LoggingAlloc(std::alloc::System);
-
-// #[global_allocator]
-// static ALLOCATOR: ServerAlloc = ServerAlloc(shared::allocator::ServerAlloc::new());
+static ALLOCATOR: ServerAlloc = ServerAlloc(shared::allocator::ServerAlloc::new());
 
 /// Global Allocator for the Server
 ///
@@ -191,7 +163,9 @@ fn main() -> std::io::Result<()> {
 
     let config = Config::load();
 
-    // ALLOCATOR .0 .initialize_buckets(config.bucket_count, 4096 * 128)?;
+    ALLOCATOR
+        .0
+        .initialize_buckets(config.bucket_count, 4096 * 128)?;
 
     let executor = Executor::get_or_init(config.bucket_count, config.io_resources);
     let reactor = Reactor::get_or_init(config.bucket_count, config.io_resources).unwrap();
