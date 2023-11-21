@@ -26,6 +26,8 @@ pub enum Direction {
 }
 
 struct Source {
+    // these wakers are None when the application is not awaiting events on this source,
+    // and Some when the application is (e.g. doing a `tcp_stream.read(&mut buf).await;`
     interest: Mutex<[Option<Waker>; 2]>,
     triggered: [AtomicBool; 2],
 }
