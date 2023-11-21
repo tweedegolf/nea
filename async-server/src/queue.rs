@@ -17,43 +17,49 @@ pub struct QueueSlotState {
     pub is_in_progress: bool,
 }
 
-pub struct QueueSlot(AtomicU8);
+pub struct QueueSlot {
+    flags: AtomicU8,
+    pub id: AtomicU32,
+}
 
 impl QueueSlot {
     const fn empty() -> Self {
-        Self(AtomicU8::new(0))
+        Self {
+            flags: AtomicU8::new(0),
+            id: AtomicU32::new(0),
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.0.load(Ordering::Relaxed) == 0
+        self.flags.load(Ordering::Relaxed) == 0
     }
 
     fn is_enqueued(&self) -> bool {
-        self.0.load(Ordering::Relaxed) & ENQUEUED_BIT != 0
+        self.flags.load(Ordering::Relaxed) & ENQUEUED_BIT != 0
     }
 
     fn is_in_progress(&self) -> bool {
-        self.0.load(Ordering::Relaxed) & IN_PROGRESS_BIT != 0
+        self.flags.load(Ordering::Relaxed) & IN_PROGRESS_BIT != 0
     }
 
     pub fn mark_empty(&self) {
-        self.0.store(0, Ordering::Relaxed);
+        self.flags.store(0, Ordering::Relaxed);
     }
 
-    fn try_process(&self) -> Result<(), ()> {
-        match self.0.compare_exchange(
+    fn try_process(&self) -> Result<u32, ()> {
+        match self.flags.compare_exchange(
             ENQUEUED_BIT,
             IN_PROGRESS_BIT,
             Ordering::SeqCst,
             Ordering::Relaxed,
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(self.id.load(Ordering::Relaxed)),
             Err(_) => Err(()),
         }
     }
 
     fn mark_enqueued(&self) -> QueueSlotState {
-        let old = self.0.fetch_or(ENQUEUED_BIT, Ordering::Relaxed);
+        let old = self.flags.fetch_or(ENQUEUED_BIT, Ordering::Relaxed);
 
         QueueSlotState {
             is_enqueued: old & ENQUEUED_BIT != 0,
@@ -62,11 +68,11 @@ impl QueueSlot {
     }
 
     fn mark_in_progress(&self) {
-        let old = self.0.fetch_or(IN_PROGRESS_BIT, Ordering::Relaxed);
+        let old = self.flags.fetch_or(IN_PROGRESS_BIT, Ordering::Relaxed);
     }
 
     pub fn clear_enqueued(&self) -> QueueSlotState {
-        let old = self.0.fetch_and(!ENQUEUED_BIT, Ordering::Relaxed);
+        let old = self.flags.fetch_and(!ENQUEUED_BIT, Ordering::Relaxed);
 
         QueueSlotState {
             is_enqueued: old & ENQUEUED_BIT != 0,
@@ -75,7 +81,7 @@ impl QueueSlot {
     }
 
     pub fn clear_in_progress(&self) -> QueueSlotState {
-        let old = self.0.fetch_and(!IN_PROGRESS_BIT, Ordering::Relaxed);
+        let old = self.flags.fetch_and(!IN_PROGRESS_BIT, Ordering::Relaxed);
 
         QueueSlotState {
             is_enqueued: old & ENQUEUED_BIT != 0,
@@ -243,12 +249,20 @@ impl ComplexQueue {
         true
     }
 
-    pub fn enqueue(&self, index: QueueIndex) -> Result<(), QueueIndex> {
+    pub fn wake(&self, index: QueueIndex) {
         let thread = thread::current().id();
 
         let Some(current) = self.queue.get(index.index as usize) else {
             panic!("{thread:?}: queue index {index:?} out of bounds");
         };
+
+        let id = current.id.load(Ordering::Relaxed);
+        if id != index.identifier {
+            log::info!("{thread:?}: skipped waking {}; out of date", index.index);
+            log::info!("{thread:?}: {} (queue) vs {} (waker)", id, index.identifier);
+
+            return;
+        }
 
         // eagerly increment (but don't wake anyone yet). This is to prevent race conditions
         // between marking the slot as enqueued and updating the count of enqueued slots.
@@ -274,14 +288,48 @@ impl ComplexQueue {
                 jobs_available - 1,
             );
         }
+    }
 
-        Ok(())
+    pub fn enqueue(&self, index: QueueIndex) {
+        let thread = thread::current().id();
+
+        let Some(current) = self.queue.get(index.index as usize) else {
+            panic!("{thread:?}: queue index {index:?} out of bounds");
+        };
+
+        // eagerly increment (but don't wake anyone yet). This is to prevent race conditions
+        // between marking the slot as enqueued and updating the count of enqueued slots.
+        let jobs_available = self.increment_jobs_available();
+
+        let old_slot_state = current.mark_enqueued();
+
+        if !old_slot_state.is_enqueued && !old_slot_state.is_in_progress {
+            log::warn!(
+                "{thread:?}: ☀️  job {} (id {}) is new in the queue ({jobs_available} jobs available)!",
+                index.index,
+                index.identifier,
+            );
+
+            current.id.store(index.identifier, Ordering::Relaxed);
+
+            // this is a new job, notify a worker
+            self.jobs_in_queue.wake_one();
+        } else {
+            // the job was already enqueue'd, revert
+            self.decrement_jobs_available();
+
+            log::warn!(
+                "{thread:?}: job {} was already in the queue ({old_slot_state:?}, {} jobs  available)!",
+                index.index,
+                jobs_available - 1,
+            );
+        }
     }
 
     #[must_use]
     pub fn done_with_item(&self, queue_slot: &QueueSlot) -> DoneWithItem {
         for _ in 0..10 {
-            let enqueued_while_in_progress = queue_slot.0.compare_exchange(
+            let enqueued_while_in_progress = queue_slot.flags.compare_exchange(
                 ENQUEUED_BIT | IN_PROGRESS_BIT,
                 IN_PROGRESS_BIT,
                 Ordering::Acquire,
@@ -294,7 +342,7 @@ impl ComplexQueue {
 
             assert_eq!(state, IN_PROGRESS_BIT);
 
-            let clear_in_progress = queue_slot.0.compare_exchange(
+            let clear_in_progress = queue_slot.flags.compare_exchange(
                 IN_PROGRESS_BIT,
                 0,
                 Ordering::Acquire,
@@ -321,7 +369,7 @@ impl ComplexQueue {
 
         for (i, queue_slot) in it {
             // find a task that is enqueued but not yet in progress
-            if let Err(()) = queue_slot.try_process() {
+            let Ok(identifier) = queue_slot.try_process() else {
                 // either
                 //
                 // - the slot is empty
@@ -338,7 +386,7 @@ impl ComplexQueue {
 
             let index = QueueIndex {
                 index: i as u32,
-                identifier: 0,
+                identifier,
             };
 
             return Some((index, queue_slot));
