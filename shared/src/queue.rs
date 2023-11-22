@@ -18,6 +18,12 @@ pub struct LockFreeQueue<T, const N: usize> {
     waiter: AtomicU32,
 }
 
+impl<T, const N: usize> Default for LockFreeQueue<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // it is safe to move a LockFreeQueue<T, N> across threads if T's can be moved across threads
 unsafe impl<T: Send, const N: usize> Send for LockFreeQueue<T, N> {}
 
@@ -192,6 +198,12 @@ const YIELD_LIMIT: u32 = 10;
 
 pub struct Backoff {
     step: Cell<u32>,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Backoff {

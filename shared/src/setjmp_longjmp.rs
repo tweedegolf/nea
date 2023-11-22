@@ -38,6 +38,9 @@ mod linux_x86_64 {
     "#
     );
 
+    /// # Safety
+    ///
+    /// Must receive exclusive mutable access to the jump buffer
     pub unsafe fn setjmp(env: *mut JumpBuf) -> SetJmp {
         extern "C-unwind" {
             #[link_name = "setjmp"]

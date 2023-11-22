@@ -3,7 +3,6 @@
 use hyper::rt::ReadBufCursor;
 use std::io::Error;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::{
     io::Write,

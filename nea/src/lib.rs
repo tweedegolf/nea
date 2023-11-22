@@ -62,19 +62,13 @@ thread_local! {
     pub(crate) static CURRENT_ARENA: AtomicU32 = AtomicU32::new(ARENA_INDEX_BEFORE_MAIN);
 }
 
-extern "C-unwind" {
-    // The application main function.
-    //
-    // Because this is a rust app, we use the `C-unwind` calling convention. That makes it possible
-    // for the app to panic, and for the server to catch that panic and recover. `C-unwind` will
-    // not be useful with roc applications, but it will still be correct.
-    #[allow(improper_ctypes)]
-    fn roc_main(input: String) -> String;
-}
-
 /// Function called when the applications hits a (from its perspective) unrecoverable error.
 ///
 /// For instance: out of memory, an assert, division by zero
+///
+/// # Safety
+///
+/// The message_ptr argument must be a valid CStr
 pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! {
     let thread_id = std::thread::current().id();
 
@@ -89,6 +83,10 @@ pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! 
 }
 
 /// Core primitive for the application's allocator.
+///
+/// # Safety
+///
+/// Should only be called after a thread has set its arena
 pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
     let bucket_index = CURRENT_ARENA.with(|v| v.load(Ordering::Relaxed)) as usize;
     assert!(bucket_index < 1000);
@@ -226,7 +224,7 @@ where
                         Ok(()) => {}
                         Err(e) => match e.kind() {
                             ErrorKind::NotConnected => {}
-                            _ => Err(e).unwrap(),
+                            _ => panic!("{e:?}"),
                         },
                     }
                 });

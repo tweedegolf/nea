@@ -63,6 +63,7 @@ pub struct Executor<F: 'static> {
 
 type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
 
+#[allow(unused)]
 type Http2Connection =
     hyper::client::conn::http2::Connection<reactor::TcpStream, String, HyperExecutor>;
 
