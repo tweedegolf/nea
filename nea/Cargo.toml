@@ -11,6 +11,6 @@ log = { path = "../log" }
 
 mio = { version = "0.8.8", features = ["os-poll", "net"] }
 serde = { version = "1.0.186", features = ["derive"] }
-hyper = { version = "1.0.0-rc.4", features = ["client", "http1", "http2"] }
-http-body-util = "0.1.0-rc.3"
+hyper = { version = "1.0.0", features = ["client", "http1", "http2"] }
+http-body-util = "0.1.0"
 toml = "0.8.0"
