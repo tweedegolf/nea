@@ -20,6 +20,8 @@ use crate::{
 };
 use crate::{ALLOCATOR, CURRENT_ARENA};
 
+use shared::setjmp_longjmp::setjmp;
+
 pub(crate) fn waker_for(queue_index: QueueIndex) -> Waker {
     let raw_waker = std::task::RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
     unsafe { Waker::from_raw(raw_waker) }
@@ -61,6 +63,7 @@ pub struct Executor<F: 'static> {
 
 type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
 
+#[allow(unused)]
 type Http2Connection =
     hyper::client::conn::http2::Connection<reactor::TcpStream, String, HyperExecutor>;
 
@@ -339,6 +342,13 @@ where
             let bucket_index = queue_index.to_bucket_index(self.io_resources);
             CURRENT_ARENA.with(|a| a.store(bucket_index.index, Ordering::Release));
 
+            match crate::JMP_BUFFER.with(|jmp_buffer| unsafe { setjmp(jmp_buffer.get()) }) {
+                shared::setjmp_longjmp::SetJmp::Called => { /* fall through */ }
+                shared::setjmp_longjmp::SetJmp::Jumped(_) => {
+                    /* the application went Out Of Memory */
+                }
+            };
+
             let io_index = IoIndex::from_index(self.io_resources, queue_index);
 
             'enqueued_while_processing: loop {
@@ -433,7 +443,7 @@ where
         let mut cx = Context::from_waker(&waker);
 
         // early return if pending
-        let () = std::task::ready!(pinned.poll(&mut cx));
+        std::task::ready!(pinned.poll(&mut cx));
 
         // this future is now done
         let old = task_mut.take();
@@ -502,12 +512,7 @@ where
         let mut cx = Context::from_waker(&waker);
 
         // early return when pending
-        let () = match connection.as_mut().poll(&mut cx) {
-            Poll::Ready(x) => x,
-            Poll::Pending => {
-                return Poll::Pending;
-            }
-        };
+        std::task::ready!(connection.as_mut().poll(&mut cx));
 
         let Some(fut) = task_mut.take() else {
             panic!("no http2 future");

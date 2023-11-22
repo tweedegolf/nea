@@ -3,11 +3,6 @@ members = [
     "log",
     "shared",
     "roc_app",
-    "server",
-    "runtime",
-    "async-server",
+    "nea",
 ]
 resolver = "2"
-
-
-

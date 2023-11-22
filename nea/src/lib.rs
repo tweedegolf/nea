@@ -1,15 +1,14 @@
 use std::{
     cell::UnsafeCell,
-    io::{Cursor, ErrorKind},
-    net::{TcpListener, TcpStream},
+    io::ErrorKind,
     os::fd::AsRawFd,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 mod config;
 mod executor;
-mod index;
+pub mod index;
 mod queue;
 mod reactor;
 
@@ -17,7 +16,24 @@ use config::Config;
 use executor::{BucketIndex, Executor};
 use index::QueueIndex;
 use reactor::Reactor;
-use shared::setjmp_longjmp::{longjmp, setjmp, JumpBuf};
+use shared::setjmp_longjmp::{longjmp, JumpBuf};
+
+pub mod net {
+    pub use crate::reactor::TcpStream;
+}
+
+pub mod http1 {
+    pub async fn handshake(
+        bucket_index: crate::index::BucketIndex,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<hyper::client::conn::http1::SendRequest<String>> {
+        crate::executor::Executor::<()>::get()
+            .unwrap()
+            .handshake(bucket_index, host, port)
+            .await
+    }
+}
 
 thread_local! {
     /// The buffer used to store the state of registers before calling application code.core
@@ -26,8 +42,6 @@ thread_local! {
     /// non-volatile registers to their previous state, so that a thread can recover from an error
     /// in the application.
     static JMP_BUFFER: UnsafeCell<JumpBuf> = UnsafeCell::new(JumpBuf::new());
-
-    static CURRENT_BUCKET: AtomicUsize = AtomicUsize::new(usize::MAX);
 }
 
 const ARENA_INDEX_BEFORE_MAIN: u32 = u32::MAX;
@@ -48,19 +62,13 @@ thread_local! {
     pub(crate) static CURRENT_ARENA: AtomicU32 = AtomicU32::new(ARENA_INDEX_BEFORE_MAIN);
 }
 
-extern "C-unwind" {
-    // The application main function.
-    //
-    // Because this is a rust app, we use the `C-unwind` calling convention. That makes it possible
-    // for the app to panic, and for the server to catch that panic and recover. `C-unwind` will
-    // not be useful with roc applications, but it will still be correct.
-    #[allow(improper_ctypes)]
-    fn roc_main(input: String) -> String;
-}
-
 /// Function called when the applications hits a (from its perspective) unrecoverable error.
 ///
 /// For instance: out of memory, an assert, division by zero
+///
+/// # Safety
+///
+/// The message_ptr argument must be a valid CStr
 pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! {
     let thread_id = std::thread::current().id();
 
@@ -75,6 +83,10 @@ pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! 
 }
 
 /// Core primitive for the application's allocator.
+///
+/// # Safety
+///
+/// Should only be called after a thread has set its arena
 pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
     let bucket_index = CURRENT_ARENA.with(|v| v.load(Ordering::Relaxed)) as usize;
     assert!(bucket_index < 1000);
@@ -158,7 +170,11 @@ unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
     }
 }
 
-fn main() -> std::io::Result<()> {
+pub fn run_request_handler<FUNC, FUT>(func: FUNC) -> std::io::Result<()>
+where
+    FUNC: Fn(BucketIndex, crate::reactor::TcpStream) -> FUT + Send + 'static + Copy,
+    FUT: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
     log::init();
 
     let config = Config::load();
@@ -204,11 +220,11 @@ fn main() -> std::io::Result<()> {
                         QueueIndex::from_bucket_index(config.io_resources, bucket_index);
                     let tcp_stream = reactor.register(queue_index, stream).unwrap();
 
-                    match hyper_app(bucket_index, tcp_stream).await {
+                    match func(bucket_index, tcp_stream).await {
                         Ok(()) => {}
                         Err(e) => match e.kind() {
                             ErrorKind::NotConnected => {}
-                            _ => Err(e).unwrap(),
+                            _ => panic!("{e:?}"),
                         },
                     }
                 });
@@ -217,155 +233,6 @@ fn main() -> std::io::Result<()> {
 
         log::info!("main spawned future for connection {i}");
     }
-
-    Ok(())
-}
-
-#[derive(Debug)]
-enum Cmd {
-    Read,
-    Write(Vec<u8>),
-    Done,
-}
-
-#[derive(Debug)]
-enum Msg {
-    Nothing,
-    Read(Vec<u8>),
-}
-
-#[derive(Debug)]
-enum Model {
-    Initial,
-    Writing,
-}
-
-fn roc_handler(model: Model, msg: Msg) -> (Model, Cmd) {
-    match (model, msg) {
-        (Model::Initial, Msg::Nothing) => {
-            // let's read something
-            (Model::Initial, Cmd::Read)
-        }
-        (Model::Initial, Msg::Read(buf)) => {
-            //
-            drop(buf);
-
-            use std::io::Write;
-            let input = "foobar";
-            let mut buffer = [0u8; 1024];
-            let mut response = Cursor::new(&mut buffer[..]);
-            let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
-            let _ = response.write_all(b"Content-Type: text/html\r\n");
-            let _ = response.write_all(b"\r\n");
-            let _ = response.write_fmt(format_args!("<html>{input}</html>"));
-            let n = response.position() as usize;
-
-            let buf = response.get_ref()[..n].to_vec();
-
-            (Model::Writing, Cmd::Write(buf))
-        }
-        (Model::Writing, _) => (Model::Writing, Cmd::Done),
-    }
-}
-
-async fn handler(
-    _bucket_index: BucketIndex,
-    tcp_stream: crate::reactor::TcpStream,
-) -> std::io::Result<()> {
-    let mut msg = Msg::Nothing;
-    let mut model = Model::Initial;
-
-    loop {
-        let (new_model, cmd) = roc_handler(model, msg);
-        model = new_model;
-
-        match cmd {
-            Cmd::Read => {
-                let mut buf = vec![0u8; 1024];
-                let n = tcp_stream.read(&mut buf).await?;
-
-                buf.truncate(n);
-                msg = Msg::Read(buf);
-            }
-            Cmd::Write(buf) => {
-                let mut remaining = buf.len();
-                while remaining > 0 {
-                    remaining -= tcp_stream.write(&buf).await?;
-                }
-
-                msg = Msg::Nothing;
-            }
-            Cmd::Done => break,
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(unused)]
-async fn hyper_app(
-    bucket_index: BucketIndex,
-    tcp_stream: reactor::TcpStream,
-) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut buffer = [0; 1024];
-    let n = tcp_stream.read(&mut buffer).await?;
-
-    let input = &buffer[..n];
-    let input = std::str::from_utf8(input).unwrap();
-
-    let url = "http://0.0.0.0:8000/build.rs"
-        .parse::<hyper::Uri>()
-        .unwrap();
-    let host = url.host().expect("uri has no host");
-    let port = url.port_u16().unwrap_or(80);
-
-    let mut sender = executor::Executor::<()>::get()
-        .unwrap()
-        .handshake(bucket_index, host, port)
-        .await
-        .unwrap();
-
-    log::info!("performed handshake {}", bucket_index.index);
-
-    let authority = url.authority().unwrap().clone();
-
-    let req = hyper::Request::builder()
-        .header("Host", "example.com")
-        .method("GET")
-        .body(String::new())
-        .unwrap();
-
-    log::info!("built request");
-
-    let mut res = sender.send_request(req).await.unwrap();
-    log::info!("sent request");
-
-    // Stream the body, writing each frame to stdout as it arrives
-    use http_body_util::BodyExt;
-    while let Some(next) = res.frame().await {
-        let frame = next.unwrap();
-    }
-
-    // std::mem::forget(res);
-
-    // std::mem::forget(res);
-    log::info!("into body");
-
-    let mut buffer = [0u8; 1024];
-    let mut response = Cursor::new(&mut buffer[..]);
-    let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
-    let _ = response.write_all(b"Content-Type: text/html\r\n");
-    let _ = response.write_all(b"\r\n");
-    let _ = response.write_fmt(format_args!("<html>{input}</html>"));
-    let n = response.position() as usize;
-
-    tcp_stream.write(&response.get_ref()[..n]).await?;
-
-    tcp_stream.flush().await?;
-
-    log::info!("handled a request");
 
     Ok(())
 }

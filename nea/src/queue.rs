@@ -34,14 +34,6 @@ impl QueueSlot {
         self.flags.load(Ordering::Relaxed) == 0
     }
 
-    fn is_enqueued(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & ENQUEUED_BIT != 0
-    }
-
-    fn is_in_progress(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & IN_PROGRESS_BIT != 0
-    }
-
     pub fn mark_empty(&self) {
         self.flags.store(0, Ordering::Relaxed);
     }
@@ -66,42 +58,20 @@ impl QueueSlot {
             is_in_progress: old & IN_PROGRESS_BIT != 0,
         }
     }
-
-    fn mark_in_progress(&self) {
-        let old = self.flags.fetch_or(IN_PROGRESS_BIT, Ordering::Relaxed);
-    }
-
-    pub fn clear_enqueued(&self) -> QueueSlotState {
-        let old = self.flags.fetch_and(!ENQUEUED_BIT, Ordering::Relaxed);
-
-        QueueSlotState {
-            is_enqueued: old & ENQUEUED_BIT != 0,
-            is_in_progress: old & IN_PROGRESS_BIT != 0,
-        }
-    }
-
-    pub fn clear_in_progress(&self) -> QueueSlotState {
-        let old = self.flags.fetch_and(!IN_PROGRESS_BIT, Ordering::Relaxed);
-
-        QueueSlotState {
-            is_enqueued: old & ENQUEUED_BIT != 0,
-            is_in_progress: old & IN_PROGRESS_BIT != 0,
-        }
-    }
 }
 
 pub struct ComplexQueue {
     queue: Box<[QueueSlot]>,
     // number of currently enqueued items
-    jobs_in_queue: Refcount2,
+    jobs_in_queue: Refcount,
 }
 
-struct Refcount2 {
+struct Refcount {
     active_mutex: Arc<Mutex<u32>>,
     active_condvar: Condvar,
 }
 
-impl Refcount2 {
+impl Refcount {
     fn new() -> Self {
         Self {
             active_mutex: Default::default(),
@@ -169,13 +139,13 @@ pub enum NextStep {
 
 impl ComplexQueue {
     pub fn with_capacity(capacity: usize) -> Self {
-        let queue = std::iter::repeat_with(|| QueueSlot::empty())
+        let queue = std::iter::repeat_with(QueueSlot::empty)
             .take(capacity)
             .collect();
 
         Self {
             queue,
-            jobs_in_queue: Refcount2::new(),
+            jobs_in_queue: Refcount::new(),
         }
     }
 
