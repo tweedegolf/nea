@@ -104,7 +104,7 @@ impl Reactor {
             )
             .unwrap();
 
-        log::info!("queue index {} added to poll", index.index);
+        log::debug!("queue index {} added to poll", index.index);
 
         let tcp_stream = TcpStream {
             tcp_stream,
@@ -257,7 +257,6 @@ impl TcpStream {
                 .unwrap();
 
             let Some(source) = source_guard.as_ref() else {
-                log::warn!("this source got terminated");
                 return Poll::Pending;
             };
 
@@ -361,7 +360,7 @@ impl hyper::rt::Write for TcpStream {
 impl Drop for TcpStream {
     fn drop(&mut self) {
         let index = QueueIndex::from_usize(self.token.0).index as usize;
-        log::info!("queue index {} removed from poll", index);
+        log::debug!("queue index {} removed from poll", index);
 
         let _ = self
             .reactor
