@@ -1,8 +1,14 @@
 #[cfg(all(unix, target_arch = "x86_64"))]
 pub use linux_x86_64::{longjmp, setjmp, JumpBuf};
 
+pub enum SetJmp {
+    Called,
+    Jumped(u32),
+}
+
 #[cfg(all(unix, target_arch = "x86_64"))]
 mod linux_x86_64 {
+    use super::SetJmp;
 
     #[repr(C)]
     pub struct JumpBuf([usize; 8]);
@@ -32,8 +38,19 @@ mod linux_x86_64 {
     "#
     );
 
-    extern "C-unwind" {
-        pub fn setjmp(env: *mut JumpBuf) -> u32;
+    pub unsafe fn setjmp(env: *mut JumpBuf) -> SetJmp {
+        extern "C-unwind" {
+            #[link_name = "setjmp"]
+            pub fn setjmp_asm(env: *mut JumpBuf) -> u32;
+        }
+
+        // TODO perform the call using inline asm? Rust's compilation model cannot deal with setjmp
+        // returning twice
+
+        match unsafe { setjmp_asm(env) } {
+            0 => SetJmp::Called,
+            n => SetJmp::Jumped(n),
+        }
     }
 
     core::arch::global_asm!(

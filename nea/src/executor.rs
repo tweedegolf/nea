@@ -20,6 +20,8 @@ use crate::{
 };
 use crate::{ALLOCATOR, CURRENT_ARENA};
 
+use shared::setjmp_longjmp::setjmp;
+
 pub(crate) fn waker_for(queue_index: QueueIndex) -> Waker {
     let raw_waker = std::task::RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
     unsafe { Waker::from_raw(raw_waker) }
@@ -338,6 +340,13 @@ where
             // configure the allocator
             let bucket_index = queue_index.to_bucket_index(self.io_resources);
             CURRENT_ARENA.with(|a| a.store(bucket_index.index, Ordering::Release));
+
+            match crate::JMP_BUFFER.with(|jmp_buffer| unsafe { setjmp(jmp_buffer.get()) }) {
+                shared::setjmp_longjmp::SetJmp::Called => { /* fall through */ }
+                shared::setjmp_longjmp::SetJmp::Jumped(_) => {
+                    /* the application went Out Of Memory */
+                }
+            };
 
             let io_index = IoIndex::from_index(self.io_resources, queue_index);
 
