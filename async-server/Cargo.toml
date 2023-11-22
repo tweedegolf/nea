@@ -16,7 +16,3 @@ serde = { version = "1.0.186", features = ["derive"] }
 hyper = { git = "https://github.com/hyperium/hyper", features = ["client", "http1", "http2"] }
 http-body-util = "0.1.0-rc.3"
 toml = "0.8.0"
-
-[build-dependencies]
-roc_app = { path = "../roc_app" }
-cc = "1.0"
