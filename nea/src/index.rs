@@ -105,7 +105,7 @@ impl std::fmt::Debug for QueueIndex {
 }
 
 impl QueueIndex {
-    pub(crate) fn to_bucket_index(&self, io_resources: IoResources) -> BucketIndex {
+    pub(crate) fn to_bucket_index(self, io_resources: IoResources) -> BucketIndex {
         let index = self.index / io_resources.per_bucket() as u32;
         assert!(index < 1000);
 
@@ -115,7 +115,7 @@ impl QueueIndex {
         }
     }
 
-    pub(crate) fn to_connection_index(&self, io_resources: IoResources) -> ConnectionIndex {
+    pub(crate) fn to_connection_index(self, io_resources: IoResources) -> ConnectionIndex {
         let bucket_index = self.index / io_resources.per_bucket() as u32;
         let connection =
             self.index % io_resources.per_bucket() as u32 - io_resources.tcp_streams as u32;
@@ -126,7 +126,7 @@ impl QueueIndex {
         }
     }
 
-    pub(crate) fn to_http2_future_index(&self, io_resources: IoResources) -> Http2FutureIndex {
+    pub(crate) fn to_http2_future_index(self, io_resources: IoResources) -> Http2FutureIndex {
         let bucket_index = self.index / io_resources.per_bucket() as u32;
         let connection = self.index % io_resources.per_bucket() as u32
             - (io_resources.tcp_streams + io_resources.http_connections) as u32;

@@ -1,10 +1,9 @@
 use std::{
     cell::UnsafeCell,
-    io::{Cursor, ErrorKind},
-    net::{TcpListener, TcpStream},
+    io::ErrorKind,
     os::fd::AsRawFd,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 mod config;
@@ -17,7 +16,7 @@ use config::Config;
 use executor::{BucketIndex, Executor};
 use index::QueueIndex;
 use reactor::Reactor;
-use shared::setjmp_longjmp::{longjmp, setjmp, JumpBuf};
+use shared::setjmp_longjmp::{longjmp, JumpBuf};
 
 pub mod net {
     pub use crate::reactor::TcpStream;

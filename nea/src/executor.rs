@@ -442,7 +442,7 @@ where
         let mut cx = Context::from_waker(&waker);
 
         // early return if pending
-        let () = std::task::ready!(pinned.poll(&mut cx));
+        std::task::ready!(pinned.poll(&mut cx));
 
         // this future is now done
         let old = task_mut.take();
@@ -511,12 +511,7 @@ where
         let mut cx = Context::from_waker(&waker);
 
         // early return when pending
-        let () = match connection.as_mut().poll(&mut cx) {
-            Poll::Ready(x) => x,
-            Poll::Pending => {
-                return Poll::Pending;
-            }
-        };
+        std::task::ready!(connection.as_mut().poll(&mut cx));
 
         let Some(fut) = task_mut.take() else {
             panic!("no http2 future");
