@@ -148,7 +148,7 @@ impl Refcount2 {
         let mut guard = self.active_mutex.lock().unwrap();
 
         if *guard == 0 {
-            log::warn!("{thread:?}: 😴");
+            log::trace!("{thread:?}: 😴");
 
             while *guard == 0 {
                 guard = self.active_condvar.wait(guard).unwrap();
@@ -207,20 +207,35 @@ impl ComplexQueue {
 
     /// Wake an existing task by putting it back into the queue
     pub fn wake(&self, index: QueueIndex) {
-        let thread = thread::current().id();
-
         let Some(current) = self.queue.get(index.index as usize) else {
+            let thread = thread::current().id();
             panic!("{thread:?}: queue index {index:?} out of bounds");
         };
 
+        // don't enqueue the task if its identifier does not match. This is a measure against
+        // enqueuing tasks that are already finished. Polling them again is pointless.
         let id = current.id.load(Ordering::Relaxed);
         if id != index.identifier {
-            log::info!("{thread:?}: skipped waking {}; out of date", index.index);
-            log::info!("{thread:?}: {} (queue) vs {} (waker)", id, index.identifier);
-
+            let thread = thread::current().id();
+            log::debug!("{thread:?}: skipped waking {}; out of date", index.index);
+            log::debug!("{thread:?}: {} (queue) vs {} (waker)", id, index.identifier);
             return;
         }
 
+        self.helper(index, current)
+    }
+
+    /// The first enqueue of a task. Must NOT be used to wake an existing task!
+    pub fn initial_enqueue(&self, index: QueueIndex) {
+        let Some(current) = self.queue.get(index.index as usize) else {
+            let thread = thread::current().id();
+            panic!("{thread:?}: queue index {index:?} out of bounds");
+        };
+
+        self.helper(index, current)
+    }
+
+    fn helper(&self, index: QueueIndex, current: &QueueSlot) {
         // eagerly increment (but don't wake anyone yet). This is to prevent race conditions
         // between marking the slot as enqueued and updating the count of enqueued slots.
         let jobs_available = self.increment_jobs_available();
@@ -228,8 +243,9 @@ impl ComplexQueue {
         let old_slot_state = current.mark_enqueued();
 
         if !old_slot_state.is_enqueued && !old_slot_state.is_in_progress {
-            log::warn!(
-                "{thread:?}: ☀️  job {} is new in the queue ({jobs_available} jobs available)",
+            log::debug!(
+                "{:?}: ☀️  job {} is new in the queue ({jobs_available} jobs available)",
+                thread::current().id(),
                 index.index
             );
 
@@ -239,45 +255,9 @@ impl ComplexQueue {
             // the job was already enqueue'd, revert
             self.decrement_jobs_available();
 
-            log::warn!(
-                "{thread:?}: job {} was already in the queue ({old_slot_state:?}, {} jobs  available)",
-                index.index,
-                jobs_available - 1,
-            );
-        }
-    }
-
-    /// The first enqueue of a task. Must NOT be used to wake an existing task!
-    pub fn initial_enqueue(&self, index: QueueIndex) {
-        let thread = thread::current().id();
-
-        let Some(current) = self.queue.get(index.index as usize) else {
-            panic!("{thread:?}: queue index {index:?} out of bounds");
-        };
-
-        // eagerly increment (but don't wake anyone yet). This is to prevent race conditions
-        // between marking the slot as enqueued and updating the count of enqueued slots.
-        let jobs_available = self.increment_jobs_available();
-
-        let old_slot_state = current.mark_enqueued();
-
-        if !old_slot_state.is_enqueued && !old_slot_state.is_in_progress {
-            log::warn!(
-                "{thread:?}: ☀️  job {} (id {}) is new in the queue ({jobs_available} jobs available)!",
-                index.index,
-                index.identifier,
-            );
-
-            current.id.store(index.identifier, Ordering::Relaxed);
-
-            // this is a new job, notify a worker
-            self.jobs_in_queue.wake_one();
-        } else {
-            // the job was already enqueue'd, revert
-            self.decrement_jobs_available();
-
-            log::warn!(
-                "{thread:?}: job {} was already in the queue ({old_slot_state:?}, {} jobs  available)!",
+            log::debug!(
+                "{:?}: job {} was already in the queue ({old_slot_state:?}, {} jobs  available)",
+                thread::current().id(),
                 index.index,
                 jobs_available - 1,
             );
@@ -341,7 +321,7 @@ impl ComplexQueue {
             // enqueued before the reference count is incremented
             let now_available = self.decrement_jobs_available();
 
-            log::warn!("{thread:?}: picked {i} (now {now_available} available)");
+            log::debug!("{thread:?}: picked {i} (now {now_available} available)");
 
             let index = QueueIndex {
                 index: i as u32,
@@ -359,9 +339,9 @@ impl ComplexQueue {
 
         loop {
             let n = self.wait_jobs_available();
-            log::warn!("{thread:?}: ⚙️  done waiting, {n} jobs available");
+            log::trace!("{thread:?}: ⚙️  done waiting, {n} jobs available");
 
-            log::warn!(
+            log::trace!(
                 "{thread:?}: blocking dequeue, {} available",
                 self.load_jobs_available()
             );
@@ -369,7 +349,7 @@ impl ComplexQueue {
             if let Some((index, queue_slot)) = self.try_dequeue() {
                 return (index, queue_slot);
             } else {
-                log::warn!("{thread:?}: could not claim the promised job");
+                log::trace!("{thread:?}: could not claim the promised job");
             }
         }
     }

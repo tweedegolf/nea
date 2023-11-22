@@ -42,14 +42,14 @@ pub(crate) const RAW_WAKER_V_TABLE: RawWakerVTable = {
         let thread = std::thread::current().id();
 
         let index = QueueIndex::from_ptr(ptr);
-        log::warn!("{thread:?}: wake {}", index.index);
+        log::trace!("{thread:?}: wake {}", index.index);
 
         // NOTE: the unit here is a lie! we just don't know the correct type for the future here
         let executor = Executor::<()>::get().unwrap();
 
         executor.inner.queue.wake(index);
 
-        log::warn!("{thread:?}: woke {}", index.index);
+        log::trace!("{thread:?}: woke {}", index.index);
     }
 
     RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw)
@@ -252,9 +252,7 @@ impl<F> Executor<F> {
                 .unwrap();
 
             if *bucket_guard == 0 {
-                // this
-                log::error!("main future is already done; dropping handshake");
-                panic!("main future is already done; dropping handshake");
+                log::warn!("main future is already done; dropping handshake");
             } else {
                 *bucket_guard += 1;
             }
@@ -380,7 +378,7 @@ where
                         // identifier so that the `wake` function on queue will always reject it
                         queue_slot.id.fetch_sub(1, Ordering::Relaxed);
 
-                        log::warn!(
+                        log::debug!(
                             "💀 job {} (rc now {})",
                             queue_index.index,
                             bucket_guard.saturating_sub(1),
@@ -474,7 +472,7 @@ where
             panic!("no connection");
         };
 
-        log::info!("{thread:?}: {} cleared", queue_index.index);
+        log::debug!("{thread:?}: {} cleared", queue_index.index);
 
         // only stores PhandomData<TcpStream>. the actual stream is not in here
         drop(connection);
@@ -495,12 +493,8 @@ where
             .lock()
             .unwrap();
 
-        let thread = std::thread::current().id();
-        // log::error!("{thread:?}: {}", queue_index.index);
-
         let Some(connection) = task_mut.deref_mut() else {
             log::error!("http2 future in the queue, but there is no future");
-            panic!();
             return Poll::Ready(());
         };
 
@@ -511,7 +505,6 @@ where
         let () = match connection.as_mut().poll(&mut cx) {
             Poll::Ready(x) => x,
             Poll::Pending => {
-                // log::error!("{thread:?}: {} pending", queue_index.index);
                 return Poll::Pending;
             }
         };
