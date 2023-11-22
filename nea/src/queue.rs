@@ -1,12 +1,13 @@
 use std::ops::Range;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::thread;
 
-use crate::executor::QueueIndex;
+use crate::executor::{BucketIndex, QueueIndex};
+use crate::index::IoResources;
 
 const ENQUEUED_BIT: u8 = 0b0001;
 const IN_PROGRESS_BIT: u8 = 0b0010;
@@ -19,14 +20,14 @@ pub struct QueueSlotState {
 
 pub struct QueueSlot {
     flags: AtomicU8,
-    pub id: AtomicU32,
+    jobs: AtomicU64,
 }
 
 impl QueueSlot {
     const fn empty() -> Self {
         Self {
             flags: AtomicU8::new(0),
-            id: AtomicU32::new(0),
+            jobs: AtomicU64::new(0),
         }
     }
 
@@ -38,14 +39,14 @@ impl QueueSlot {
         self.flags.store(0, Ordering::Relaxed);
     }
 
-    fn try_process(&self) -> Result<u32, ()> {
+    fn try_process(&self) -> Result<(), ()> {
         match self.flags.compare_exchange(
             ENQUEUED_BIT,
             IN_PROGRESS_BIT,
-            Ordering::SeqCst,
+            Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => Ok(self.id.load(Ordering::Relaxed)),
+            Ok(_) => Ok(()),
             Err(_) => Err(()),
         }
     }
@@ -58,12 +59,30 @@ impl QueueSlot {
             is_in_progress: old & IN_PROGRESS_BIT != 0,
         }
     }
+
+    pub fn dequeue(&self) -> Option<usize> {
+        let value = self.jobs.load(Ordering::Relaxed);
+
+        if value == 0 {
+            return None;
+        }
+
+        let index = value.trailing_zeros();
+
+        let mask = 1 << index;
+        self.jobs.fetch_and(!mask, Ordering::Relaxed);
+
+        log::trace!("dequeue {index}");
+
+        Some(index as usize)
+    }
 }
 
 pub struct ComplexQueue {
     queue: Box<[QueueSlot]>,
     // number of currently enqueued items
     jobs_in_queue: Refcount,
+    io_resources: IoResources,
 }
 
 struct Refcount {
@@ -138,14 +157,15 @@ pub enum NextStep {
 }
 
 impl ComplexQueue {
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(number_of_buckets: usize, io_resources: IoResources) -> Self {
         let queue = std::iter::repeat_with(QueueSlot::empty)
-            .take(capacity)
+            .take(number_of_buckets)
             .collect();
 
         Self {
             queue,
             jobs_in_queue: Refcount::new(),
+            io_resources,
         }
     }
 
@@ -176,36 +196,43 @@ impl ComplexQueue {
     }
 
     /// Wake an existing task by putting it back into the queue
-    pub fn wake(&self, index: QueueIndex) {
-        let Some(current) = self.queue.get(index.index as usize) else {
-            let thread = thread::current().id();
-            panic!("{thread:?}: queue index {index:?} out of bounds");
-        };
-
-        // don't enqueue the task if its identifier does not match. This is a measure against
-        // enqueuing tasks that are already finished. Polling them again is pointless.
-        let id = current.id.load(Ordering::Relaxed);
-        if id != index.identifier {
-            let thread = thread::current().id();
-            log::debug!("{thread:?}: skipped waking {}; out of date", index.index);
-            log::debug!("{thread:?}: {} (queue) vs {} (waker)", id, index.identifier);
-            return;
-        }
-
-        self.helper(index, current)
+    pub fn wake(&self, queue_index: QueueIndex) {
+        self.initial_enqueue(queue_index)
     }
 
     /// The first enqueue of a task. Must NOT be used to wake an existing task!
-    pub fn initial_enqueue(&self, index: QueueIndex) {
-        let Some(current) = self.queue.get(index.index as usize) else {
-            let thread = thread::current().id();
-            panic!("{thread:?}: queue index {index:?} out of bounds");
+    pub fn initial_enqueue(&self, queue_index: QueueIndex) {
+        let bucket_index = queue_index.to_bucket_index(self.io_resources);
+
+        let Some(current) = self.queue.get(bucket_index.index as usize) else {
+            panic!(
+                "{:?}: bucket index {:?} out of bounds",
+                thread::current().id(),
+                bucket_index.index,
+            );
         };
 
-        self.helper(index, current)
+        let bucket_index = queue_index.to_bucket_index(self.io_resources);
+        let bucket_offset = queue_index.index as usize % self.io_resources.per_bucket();
+        self.helper(bucket_index, bucket_offset, current)
     }
 
-    fn helper(&self, index: QueueIndex, current: &QueueSlot) {
+    fn helper(&self, bucket_index: BucketIndex, bucket_offset: usize, current: &QueueSlot) {
+        let mask = 1 << bucket_offset;
+        let old_jobs = current.jobs.fetch_or(mask, Ordering::Relaxed);
+
+        let queue_index =
+            bucket_index.index * self.io_resources.per_bucket() as u32 + bucket_offset as u32;
+
+        let is_new = old_jobs & mask == 0;
+
+        if !is_new {
+            log::trace!("queue index {queue_index} was already enqueued");
+            return;
+        } else {
+            log::trace!("queue index {queue_index} is new in the queue");
+        }
+
         // eagerly increment (but don't wake anyone yet). This is to prevent race conditions
         // between marking the slot as enqueued and updating the count of enqueued slots.
         let jobs_available = self.increment_jobs_available();
@@ -214,9 +241,9 @@ impl ComplexQueue {
 
         if !old_slot_state.is_enqueued && !old_slot_state.is_in_progress {
             log::debug!(
-                "{:?}: ☀️  job {} is new in the queue ({jobs_available} jobs available)",
+                "{:?}: ☀️  bucket {} is new in the queue ({jobs_available} jobs available)",
                 thread::current().id(),
-                index.index
+                bucket_index.index
             );
 
             // this is a new job, notify a worker
@@ -226,16 +253,16 @@ impl ComplexQueue {
             self.decrement_jobs_available();
 
             log::debug!(
-                "{:?}: job {} was already in the queue ({old_slot_state:?}, {} jobs  available)",
+                "{:?}: bucket {} was already in the queue ({old_jobs:b}, {old_slot_state:?}, {} jobs  available)",
                 thread::current().id(),
-                index.index,
+                bucket_index.index,
                 jobs_available - 1,
             );
         }
     }
 
     #[must_use]
-    pub fn done_with_item(&self, queue_slot: &QueueSlot) -> NextStep {
+    pub fn done_with_bucket(&self, queue_slot: &QueueSlot) -> NextStep {
         // in theory you can be unlucky and have the clear progress step fail.
         for _ in std::iter::repeat(()).take(2) {
             let enqueued_while_in_progress = queue_slot.flags.compare_exchange(
@@ -249,7 +276,7 @@ impl ComplexQueue {
                 return NextStep::GoAgain;
             };
 
-            assert_eq!(state, IN_PROGRESS_BIT);
+            assert_eq!(state, IN_PROGRESS_BIT, "not in progress");
 
             let clear_in_progress = queue_slot.flags.compare_exchange(
                 IN_PROGRESS_BIT,
@@ -267,7 +294,7 @@ impl ComplexQueue {
         unreachable!("could not clear in progress state")
     }
 
-    fn try_dequeue(&self) -> Option<(QueueIndex, &QueueSlot)> {
+    fn try_dequeue(&self) -> Option<(BucketIndex, &QueueSlot)> {
         let thread = thread::current().id();
 
         // first, try to find something
@@ -291,11 +318,11 @@ impl ComplexQueue {
             // enqueued before the reference count is incremented
             let now_available = self.decrement_jobs_available();
 
-            log::debug!("{thread:?}: picked {i} (now {now_available} available)");
+            log::debug!("{thread:?}: picked {i} (now {now_available} buckets available)");
 
-            let index = QueueIndex {
+            let index = BucketIndex {
                 index: i as u32,
-                identifier,
+                identifier: 0,
             };
 
             return Some((index, queue_slot));
@@ -304,22 +331,22 @@ impl ComplexQueue {
         None
     }
 
-    pub fn blocking_dequeue(&self) -> (QueueIndex, &QueueSlot) {
+    pub fn blocking_dequeue(&self) -> (BucketIndex, &QueueSlot) {
         let thread = thread::current().id();
 
         loop {
             let n = self.wait_jobs_available();
-            log::trace!("{thread:?}: ⚙️  done waiting, {n} jobs available");
+            log::trace!("{thread:?}: ⚙️  done waiting, {n} buckets available");
 
             log::trace!(
-                "{thread:?}: blocking dequeue, {} available",
+                "{thread:?}: blocking dequeue, {} buckets available",
                 self.load_jobs_available()
             );
 
             if let Some((index, queue_slot)) = self.try_dequeue() {
                 return (index, queue_slot);
             } else {
-                log::trace!("{thread:?}: could not claim the promised job");
+                log::trace!("{thread:?}: could not claim the promised bucket");
             }
         }
     }

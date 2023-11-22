@@ -15,7 +15,7 @@ use std::{
 pub use crate::index::{BucketIndex, ConnectionIndex, Http2FutureIndex, IoIndex, QueueIndex};
 use crate::{
     index::IoResources,
-    queue::{ComplexQueue, NextStep},
+    queue::{ComplexQueue, NextStep, QueueSlot},
     reactor, ARENA_INDEX_EXECUTOR,
 };
 use crate::{ALLOCATOR, CURRENT_ARENA};
@@ -43,15 +43,15 @@ pub(crate) const RAW_WAKER_V_TABLE: RawWakerVTable = {
     fn wake(ptr: *const ()) {
         let thread = std::thread::current().id();
 
-        let index = QueueIndex::from_ptr(ptr);
-        log::trace!("{thread:?}: wake {}", index.index);
+        let queue_index = QueueIndex::from_ptr(ptr);
+        log::trace!("{thread:?}: wake queue index {}", queue_index.index);
 
         // NOTE: the unit here is a lie! we just don't know the correct type for the future here
         let executor = Executor::<()>::get().unwrap();
 
-        executor.inner.queue.wake(index);
+        executor.inner.queue.wake(queue_index);
 
-        log::trace!("{thread:?}: woke {}", index.index);
+        log::trace!("{thread:?}: woke queue index {}", queue_index.index);
     }
 
     RawWakerVTable::new(clone_raw, wake, wake_by_ref, drop_raw)
@@ -118,8 +118,8 @@ where
             index: (http2_future_start_index + i) as u32,
         };
 
-        let queue_index =
-            QueueIndex::from_http2_future_index(executor.inner.io_resources, http2_future_index);
+        let io_resources = executor.inner.io_resources;
+        let queue_index = QueueIndex::from_http2_future_index(io_resources, http2_future_index);
 
         executor.inner.queue.initial_enqueue(queue_index);
     }
@@ -168,7 +168,7 @@ where
                     .take(http2_future_count)
                     .collect();
 
-                let queue = ComplexQueue::with_capacity(queue_capacity);
+                let queue = ComplexQueue::with_capacity(bucket_count, io_resources);
 
                 let inner = Inner {
                     io_resources,
@@ -212,7 +212,8 @@ where
     pub fn execute(&self, bucket_index: BucketIndex, fut: F) {
         self.inner.set(bucket_index, fut);
 
-        let queue_index = QueueIndex::from_bucket_index(self.inner.io_resources, bucket_index);
+        let io_resources = self.inner.io_resources;
+        let queue_index = QueueIndex::from_bucket_index(io_resources, bucket_index);
 
         let range = self.inner.io_resources.queue_slots(bucket_index);
         assert!(self.inner.queue.is_range_empty(range));
@@ -298,8 +299,8 @@ impl<F> Executor<F> {
 
         let reactor = reactor::Reactor::get().unwrap();
 
-        let queue_index =
-            QueueIndex::from_connection_index(self.inner.io_resources, connection_index);
+        let io_resources = self.inner.io_resources;
+        let queue_index = QueueIndex::from_connection_index(io_resources, connection_index);
         let stream = reactor.register(queue_index, stream).unwrap();
 
         let hyper_executor = HyperExecutor { bucket_index };
@@ -330,16 +331,94 @@ enum HyperWake {
     AfterDeath,
 }
 
+enum DoneWithBucket {
+    ForNow,
+    Forever,
+}
+
 impl<F> Inner<F>
 where
     F: Future<Output = ()> + Send,
 {
+    fn run_bucket(&self, bucket_index: BucketIndex, queue_slot: &QueueSlot) -> DoneWithBucket {
+        log::trace!("processing bucket {}", bucket_index.index);
+
+        'bucket: loop {
+            let Some(bucket_offset) = queue_slot.dequeue() else {
+                log::trace!("no more work (for now) bucket {}", bucket_index.index);
+                return DoneWithBucket::ForNow;
+            };
+
+            let queue_index = QueueIndex {
+                index: bucket_index.index * self.io_resources.per_bucket() as u32
+                    + bucket_offset as u32,
+                identifier: 0,
+            };
+
+            log::trace!("processing queue index {}", queue_index.index);
+
+            let io_index = IoIndex::from_index(self.io_resources, queue_index);
+
+            let poll_result = match io_index {
+                IoIndex::InputStream(bucket_index) => {
+                    self.poll_input_stream(queue_index, bucket_index)
+                }
+                IoIndex::CustomStream(_) => todo!(),
+                IoIndex::HttpConnection(connection_index) => {
+                    match self.poll_http_connection(queue_index, connection_index) {
+                        Poll::Ready(HyperWake::Legit) => Poll::Ready(()),
+                        Poll::Ready(HyperWake::AfterDeath) => continue 'bucket,
+                        Poll::Pending => Poll::Pending,
+                    }
+                }
+                IoIndex::Http2Future(future_index) => {
+                    self.poll_http2_future(queue_index, future_index)
+                }
+            };
+
+            match poll_result {
+                Poll::Pending => {
+                    // done with this queue index, but another job in this bucket may be ready for
+                    // processing
+                    continue 'bucket;
+                }
+                Poll::Ready(()) => {
+                    // NOTE: the future is already dropped by the polling functions
+
+                    // must block if there is a race condition with the executor trying to find a free slot
+                    let mut bucket_guard =
+                        self.refcounts[bucket_index.index as usize].lock().unwrap();
+
+                    log::debug!(
+                        "💀 job {} (rc now {})",
+                        queue_index.index,
+                        bucket_guard.saturating_sub(1),
+                    );
+
+                    // assert!(*bucket_guard != 0);
+
+                    if *bucket_guard == 1 {
+                        // clear the memory
+                        ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
+
+                        *bucket_guard = 0;
+
+                        return DoneWithBucket::Forever;
+                    } else {
+                        *bucket_guard -= 1;
+
+                        continue 'bucket;
+                    }
+                }
+            }
+        }
+    }
+
     fn run_worker(&self) -> ! {
-        'outer: loop {
-            let (queue_index, queue_slot) = self.queue.blocking_dequeue();
+        loop {
+            let (bucket_index, queue_slot) = self.queue.blocking_dequeue();
 
             // configure the allocator
-            let bucket_index = queue_index.to_bucket_index(self.io_resources);
             CURRENT_ARENA.with(|a| a.store(bucket_index.index, Ordering::Release));
 
             match crate::JMP_BUFFER.with(|jmp_buffer| unsafe { setjmp(jmp_buffer.get()) }) {
@@ -349,79 +428,24 @@ where
                 }
             };
 
-            let io_index = IoIndex::from_index(self.io_resources, queue_index);
-
-            'enqueued_while_processing: loop {
-                let poll_result = match io_index {
-                    IoIndex::InputStream(bucket_index) => {
-                        self.poll_input_stream(queue_index, bucket_index)
-                    }
-                    IoIndex::CustomStream(_) => todo!(),
-                    IoIndex::HttpConnection(connection_index) => {
-                        match self.poll_http_connection(queue_index, connection_index) {
-                            Poll::Ready(HyperWake::Legit) => Poll::Ready(()),
-                            Poll::Ready(HyperWake::AfterDeath) => {
-                                // destructors in the main future (polled by poll_input_stream) can cause
-                                // a wake of this task. But often this task is already complete, and there
-                                // is nothing sensible to do.
-                                let _ = self.queue.done_with_item(queue_slot);
-                                continue 'outer;
+            loop {
+                match self.run_bucket(bucket_index, queue_slot) {
+                    DoneWithBucket::Forever | DoneWithBucket::ForNow => {
+                        match self.queue.done_with_bucket(queue_slot) {
+                            NextStep::Done => {
+                                log::trace!(
+                                    "bucket {} marked as not enqueued, not in progress",
+                                    bucket_index.index
+                                );
+                                break;
                             }
-                            Poll::Pending => Poll::Pending,
+                            NextStep::GoAgain => {
+                                log::trace!("bucket {} marked as not enqueued", bucket_index.index);
+
+                                continue;
+                            }
                         }
                     }
-                    IoIndex::Http2Future(future_index) => {
-                        self.poll_http2_future(queue_index, future_index)
-                    }
-                };
-
-                match poll_result {
-                    Poll::Ready(()) => {
-                        // NOTE: the future is already dropped by the polling functions
-
-                        // must block if there is a race condition with the executor trying to find a free slot
-                        let mut bucket_guard =
-                            self.refcounts[bucket_index.index as usize].lock().unwrap();
-
-                        // this slot is now done (until we put a new connection into it). To
-                        // prevent hyper from waking it again (it will do that), invalidate the
-                        // identifier so that the `wake` function on queue will always reject it
-                        queue_slot.id.fetch_sub(1, Ordering::Relaxed);
-
-                        log::debug!(
-                            "💀 job {} (rc now {})",
-                            queue_index.index,
-                            bucket_guard.saturating_sub(1),
-                        );
-
-                        // assert!(*bucket_guard != 0);
-
-                        if *bucket_guard == 1 {
-                            // clear the memory
-                            ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
-
-                            *bucket_guard = 0;
-
-                            queue_slot.mark_empty();
-
-                            continue 'outer;
-                        } else {
-                            *bucket_guard -= 1;
-
-                            // even if the task is enqueue'd again, there is nothing to do
-                            queue_slot.mark_empty();
-
-                            continue 'outer;
-                        }
-                    }
-                    Poll::Pending => match self.queue.done_with_item(queue_slot) {
-                        NextStep::Done => {
-                            continue 'outer;
-                        }
-                        NextStep::GoAgain => {
-                            continue 'enqueued_while_processing;
-                        }
-                    },
                 }
             }
         }
@@ -482,7 +506,7 @@ where
             panic!("no connection");
         };
 
-        log::debug!("{thread:?}: {} cleared", queue_index.index);
+        log::debug!("{thread:?}: queue index {} cleared", queue_index.index);
 
         // only stores PhandomData<TcpStream>. the actual stream is not in here
         drop(connection);
