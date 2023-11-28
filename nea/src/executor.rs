@@ -4,9 +4,10 @@
 use std::{
     future::Future,
     ops::DerefMut,
+    os::fd::{FromRawFd, RawFd},
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicI32, AtomicU32, Ordering},
         Mutex, OnceLock,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -19,8 +20,6 @@ use crate::{
     reactor, ARENA_INDEX_EXECUTOR,
 };
 use crate::{ALLOCATOR, CURRENT_ARENA};
-
-use shared::setjmp_longjmp::setjmp;
 
 pub(crate) fn waker_for(queue_index: QueueIndex) -> Waker {
     let raw_waker = std::task::RawWaker::new(queue_index.to_ptr(), &RAW_WAKER_V_TABLE);
@@ -133,6 +132,7 @@ struct Inner<F> {
     /// number of active queue slots for each bucket
     refcounts: Box<[Mutex<u8>]>,
     futures: Box<[Mutex<Option<F>>]>,
+    tcp_streams: Box<[AtomicI32]>,
     connections: Box<[Mutex<Slot<Http1Connection>>]>,
     http2_futures: Box<[Mutex<Option<PinBoxFuture>>]>,
     queue: crate::queue::ComplexQueue,
@@ -170,9 +170,14 @@ where
 
                 let queue = ComplexQueue::with_capacity(bucket_count, io_resources);
 
+                let tcp_streams = std::iter::repeat_with(|| AtomicI32::new(0))
+                    .take(bucket_count)
+                    .collect();
+
                 let inner = Inner {
                     io_resources,
                     futures,
+                    tcp_streams,
                     refcounts,
                     connections,
                     http2_futures,
@@ -209,8 +214,8 @@ where
         self.inner.try_claim()
     }
 
-    pub fn execute(&self, bucket_index: BucketIndex, fut: F) {
-        self.inner.set(bucket_index, fut);
+    pub fn execute(&self, fd: RawFd, bucket_index: BucketIndex, fut: F) {
+        self.inner.set(fd, bucket_index, fut);
 
         let io_resources = self.inner.io_resources;
         let queue_index = QueueIndex::from_bucket_index(io_resources, bucket_index);
@@ -336,6 +341,33 @@ enum DoneWithBucket {
     Forever,
 }
 
+fn send_out_of_memory_response(mut socket: std::net::TcpStream) -> std::io::Result<()> {
+    use std::io::Write;
+
+    socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\n")?;
+    socket.write_all(b"Content-Type: text/plain\r\n")?;
+    socket.write_all(b"\r\n")?;
+    socket.write_all(b"Internal Server Error: Out of Memory\r\n")?;
+    socket.flush()?;
+
+    // a proper shutdown of the connection. We don't need a Content-Length header
+    // if we close the connetion in this way
+    socket.shutdown(std::net::Shutdown::Write)
+}
+
+#[derive(Debug)]
+pub enum SetJmp {
+    Called,
+    Jumped(u32),
+}
+
+fn setjmp(jmp_buf: &mut shared::setjmp_longjmp::JumpBuf) -> SetJmp {
+    match unsafe { shared::setjmp_longjmp::setjmp(jmp_buf) } {
+        0 => SetJmp::Called,
+        n => SetJmp::Jumped(n),
+    }
+}
+
 impl<F> Inner<F>
 where
     F: Future<Output = ()> + Send,
@@ -414,6 +446,32 @@ where
         }
     }
 
+    fn cleanup_bucket(&self, bucket_index: BucketIndex) {
+        // send back an http error response
+        let socket_index = QueueIndex::from_bucket_index(self.io_resources, bucket_index);
+        let socket_fd = self.tcp_streams[socket_index.index as usize].load(Ordering::Relaxed);
+
+        let socket = unsafe { std::net::TcpStream::from_raw_fd(socket_fd) };
+        let _ = send_out_of_memory_response(socket);
+
+        // drop all the http connections (should clean up mio registration?)
+        for index in self.io_resources.http_connections(bucket_index) {
+            *self.connections[index].try_lock().unwrap() = Slot::Empty;
+        }
+
+        // drop the main future
+        let _ = self.futures[socket_index.index as usize]
+            .lock()
+            .unwrap()
+            .take();
+
+        // clean up the memory
+        ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
+
+        // signals that this bucket is now free for the next request
+        *self.refcounts[bucket_index.index as usize].lock().unwrap() = 0;
+    }
+
     fn run_worker(&self) -> ! {
         loop {
             let (bucket_index, queue_slot) = self.queue.blocking_dequeue();
@@ -421,10 +479,16 @@ where
             // configure the allocator
             CURRENT_ARENA.with(|a| a.store(bucket_index.index, Ordering::Release));
 
-            match crate::JMP_BUFFER.with(|jmp_buffer| unsafe { setjmp(jmp_buffer.get()) }) {
-                shared::setjmp_longjmp::SetJmp::Called => { /* fall through */ }
-                shared::setjmp_longjmp::SetJmp::Jumped(_) => {
+            match setjmp(unsafe { &mut crate::JMP_BUFFER }) {
+                SetJmp::Called => { /* fall through */ }
+                SetJmp::Jumped(_) => {
                     /* the application went Out Of Memory */
+                    eprintln!("did the jump");
+
+                    self.cleanup_bucket(bucket_index);
+
+                    // everything has been cleaned up. This thread is ready for the next request
+                    continue;
                 }
             };
 
@@ -548,11 +612,13 @@ where
         Poll::Ready(())
     }
 
-    fn set(&self, index: BucketIndex, fut: F) {
+    fn set(&self, fd: RawFd, index: BucketIndex, fut: F) {
         let old_value = self.futures[index.index as usize]
             .try_lock()
             .unwrap()
             .replace(fut);
+
+        self.tcp_streams[index.index as usize].store(fd, Ordering::Relaxed);
 
         // NOTE try_claim already set the refcount of this slot to 1
 
