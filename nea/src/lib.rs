@@ -1,5 +1,5 @@
 use std::{
-    cell::UnsafeCell,
+    cell::RefCell,
     io::ErrorKind,
     os::fd::AsRawFd,
     ptr::NonNull,
@@ -41,7 +41,7 @@ thread_local! {
     /// An error in the application code (out of memory, a panic, a segfault) will restore the
     /// non-volatile registers to their previous state, so that a thread can recover from an error
     /// in the application.
-    static JMP_BUFFER: UnsafeCell<JumpBuf> = UnsafeCell::new(JumpBuf::new());
+    static JMP_BUFFER: RefCell<JumpBuf> = const { RefCell::new(JumpBuf::new()) };
 }
 
 const ARENA_INDEX_BEFORE_MAIN: u32 = u32::MAX;
@@ -79,7 +79,8 @@ pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! 
 
     eprintln!("thread {thread_id:?} hit a panic {panic_tag}: {message}");
 
-    JMP_BUFFER.with(|env| unsafe { longjmp(env.get(), 1) })
+    let jmp_buf = JMP_BUFFER.with_borrow(|jmp_buf| *jmp_buf);
+    unsafe { longjmp(&jmp_buf, 1) }
 }
 
 /// Core primitive for the application's allocator.
@@ -210,7 +211,7 @@ where
                 stream.shutdown(std::net::Shutdown::Both).unwrap();
             }
             Some(bucket_index) => {
-                executor.execute(bucket_index, async move {
+                executor.execute(fd, bucket_index, async move {
                     log::info!(
                         "new connection {i} (index = {}, fd = {fd})",
                         bucket_index.index
