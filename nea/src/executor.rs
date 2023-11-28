@@ -8,10 +8,12 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicI32, AtomicU32, Ordering},
-        Mutex, OnceLock,
+        Mutex, MutexGuard, OnceLock,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
+
+use shared::setjmp_longjmp::{setjmp, JumpBuf};
 
 pub use crate::index::{BucketIndex, ConnectionIndex, Http2FutureIndex, IoIndex, QueueIndex};
 use crate::{
@@ -267,6 +269,7 @@ enum HyperWake {
 enum DoneWithBucket {
     ForNow,
     Forever,
+    OutOfMemory,
 }
 
 fn send_out_of_memory_response(mut socket: std::net::TcpStream) -> std::io::Result<()> {
@@ -281,19 +284,6 @@ fn send_out_of_memory_response(mut socket: std::net::TcpStream) -> std::io::Resu
     // a proper shutdown of the connection. We don't need a Content-Length header
     // if we close the connetion in this way
     socket.shutdown(std::net::Shutdown::Write)
-}
-
-#[derive(Debug)]
-pub enum SetJmp {
-    Called,
-    Jumped(u32),
-}
-
-fn setjmp(jmp_buf: &mut shared::setjmp_longjmp::JumpBuf) -> SetJmp {
-    match unsafe { shared::setjmp_longjmp::setjmp(jmp_buf) } {
-        0 => SetJmp::Called,
-        n => SetJmp::Jumped(n),
-    }
 }
 
 impl<F> Inner<F>
@@ -321,13 +311,59 @@ where
 
             let poll_result = match io_index {
                 IoIndex::InputStream(bucket_index) => {
-                    self.poll_input_stream(queue_index, bucket_index)
+                    let task_mut = self.futures[bucket_index.index as usize]
+                        .try_lock()
+                        .unwrap();
+
+                    let mut jmp_buf = JumpBuf::new();
+                    match unsafe { setjmp(&mut jmp_buf) } {
+                        0 => {
+                            crate::JMP_BUFFER.with_borrow_mut(|jb| *jb = jmp_buf);
+                            self.poll_input_stream(task_mut, queue_index)
+                        }
+                        _ => {
+                            /* the application went Out Of Memory */
+                            let thread = std::thread::current().id();
+                            let bucket = bucket_index.index;
+                            log::info!("{thread:?}: emptying bucket {bucket} after OOM");
+
+                            // free the mutex so cleanup can clean it up
+                            drop(task_mut);
+
+                            self.cleanup_bucket(bucket_index);
+
+                            // everything has been cleaned up. This thread is ready for the next request
+                            return DoneWithBucket::OutOfMemory;
+                        }
+                    }
                 }
                 IoIndex::HttpConnection(connection_index) => {
-                    match self.poll_http_connection(queue_index, connection_index) {
-                        Poll::Ready(HyperWake::Legit) => Poll::Ready(()),
-                        Poll::Ready(HyperWake::AfterDeath) => continue 'bucket,
-                        Poll::Pending => Poll::Pending,
+                    let task_mut = self.connections[connection_index.index as usize]
+                        .lock()
+                        .unwrap();
+
+                    let mut jmp_buf = JumpBuf::new();
+                    match unsafe { setjmp(&mut jmp_buf) } {
+                        0 => {
+                            crate::JMP_BUFFER.with_borrow_mut(|jb| *jb = jmp_buf);
+
+                            match self.poll_http_connection(task_mut, queue_index) {
+                                Poll::Ready(HyperWake::Legit) => Poll::Ready(()),
+                                Poll::Ready(HyperWake::AfterDeath) => continue 'bucket,
+                                Poll::Pending => Poll::Pending,
+                            }
+                        }
+                        _ => {
+                            /* the application went Out Of Memory */
+
+                            // free the mutex so cleanup can clean it up
+                            drop(task_mut);
+
+                            self.cleanup_bucket(bucket_index);
+
+                            // everything has been cleaned up. This thread is ready for the next request
+                            return DoneWithBucket::OutOfMemory;
+                        }
                     }
                 }
             };
@@ -403,19 +439,6 @@ where
             // configure the allocator
             CURRENT_ARENA.with(|a| a.store(bucket_index.index, Ordering::Release));
 
-            match setjmp(unsafe { &mut crate::JMP_BUFFER }) {
-                SetJmp::Called => { /* fall through */ }
-                SetJmp::Jumped(_) => {
-                    /* the application went Out Of Memory */
-                    eprintln!("did the jump");
-
-                    self.cleanup_bucket(bucket_index);
-
-                    // everything has been cleaned up. This thread is ready for the next request
-                    continue;
-                }
-            };
-
             loop {
                 match self.run_bucket(bucket_index, queue_slot) {
                     DoneWithBucket::Forever | DoneWithBucket::ForNow => {
@@ -434,16 +457,17 @@ where
                             }
                         }
                     }
+                    DoneWithBucket::OutOfMemory => continue,
                 }
             }
         }
     }
 
-    fn poll_input_stream(&self, queue_index: QueueIndex, bucket_index: BucketIndex) -> Poll<()> {
-        let mut task_mut = self.futures[bucket_index.index as usize]
-            .try_lock()
-            .unwrap();
-
+    fn poll_input_stream(
+        &self,
+        mut task_mut: MutexGuard<'_, Option<F>>,
+        queue_index: QueueIndex,
+    ) -> Poll<()> {
         let fut = match task_mut.as_mut() {
             None => panic!("input stream race condition"),
             Some(inner) => inner,
@@ -466,14 +490,10 @@ where
 
     fn poll_http_connection(
         &self,
+        mut task_mut: MutexGuard<'_, Slot<Http1Connection>>,
         queue_index: QueueIndex,
-        connection_index: ConnectionIndex,
     ) -> Poll<HyperWake> {
         let thread = std::thread::current().id();
-
-        let mut task_mut = self.connections[connection_index.index as usize]
-            .lock()
-            .unwrap();
 
         // for some reason, Hyper wakes tasks that are already already complete. We can't have that!
         let connection = match task_mut.deref_mut() {

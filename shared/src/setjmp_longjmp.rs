@@ -9,10 +9,8 @@ pub enum SetJmp {
 
 #[cfg(all(unix, target_arch = "x86_64"))]
 mod linux_x86_64 {
-    use super::SetJmp;
-
     #[repr(C)]
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub struct JumpBuf([usize; 8]);
 
     impl JumpBuf {

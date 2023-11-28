@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     io::ErrorKind,
     os::fd::AsRawFd,
     ptr::NonNull,
@@ -34,16 +35,14 @@ pub mod http1 {
     }
 }
 
-// thread_local! {
-//     /// The buffer used to store the state of registers before calling application code.core
-//     ///
-//     /// An error in the application code (out of memory, a panic, a segfault) will restore the
-//     /// non-volatile registers to their previous state, so that a thread can recover from an error
-//     /// in the application.
-//     // static JMP_BUFFER: UnsafeCell<JumpBuf> = UnsafeCell::new(JumpBuf::new());
-// }
-
-pub(crate) static mut JMP_BUFFER: JumpBuf = JumpBuf::new();
+thread_local! {
+    /// The buffer used to store the state of registers before calling application code.core
+    ///
+    /// An error in the application code (out of memory, a panic, a segfault) will restore the
+    /// non-volatile registers to their previous state, so that a thread can recover from an error
+    /// in the application.
+    static JMP_BUFFER: RefCell<JumpBuf> = const { RefCell::new(JumpBuf::new()) };
+}
 
 const ARENA_INDEX_BEFORE_MAIN: u32 = u32::MAX;
 pub(crate) const ARENA_INDEX_EXECUTOR: u32 = u32::MAX - 1;
@@ -80,13 +79,8 @@ pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! 
 
     eprintln!("thread {thread_id:?} hit a panic {panic_tag}: {message}");
 
-    // JMP_BUFFER.with(|env| dbg!(unsafe { &*env.get() }));
-
-    // JMP_BUFFER.with(|env| unsafe { longjmp(env.get(), 1) })
-
-    unsafe { dbg!(&JMP_BUFFER) };
-
-    unsafe { longjmp(&JMP_BUFFER, 1) }
+    let jmp_buf = JMP_BUFFER.with_borrow(|jmp_buf| *jmp_buf);
+    unsafe { longjmp(&jmp_buf, 1) }
 }
 
 /// Core primitive for the application's allocator.
