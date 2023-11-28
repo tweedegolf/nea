@@ -1,5 +1,4 @@
 use std::{
-    cell::UnsafeCell,
     io::ErrorKind,
     os::fd::AsRawFd,
     ptr::NonNull,

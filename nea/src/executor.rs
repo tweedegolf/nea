@@ -62,70 +62,6 @@ pub struct Executor<F: 'static> {
 
 type Http1Connection = hyper::client::conn::http1::Connection<reactor::TcpStream, String>;
 
-#[allow(unused)]
-type Http2Connection =
-    hyper::client::conn::http2::Connection<reactor::TcpStream, String, HyperExecutor>;
-
-#[derive(Clone, Copy)]
-struct HyperExecutor {
-    bucket_index: BucketIndex,
-}
-
-impl<F> hyper::rt::Executor<F> for HyperExecutor
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    fn execute(&self, future: F) {
-        // NOTE: the unit here is a lie! we just don't know the correct type for the future here
-        let executor = Executor::<()>::get().unwrap();
-
-        // make a future that just always returns unit
-        let future = async move {
-            let _ = future.await;
-        };
-
-        let pinned = Box::pin(future);
-
-        let indices = executor.inner.io_resources.http2_futures(self.bucket_index);
-        let http2_future_start_index = indices.start;
-
-        let lock = executor.inner.http2_futures[indices]
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| Some((i, slot.try_lock().ok()?)))
-            .find_map(|(i, mut slot)| match slot.deref_mut() {
-                None => Some((i, slot)),
-                Some(_) => None,
-            });
-
-        let Some((i, mut slot)) = lock else {
-            todo!("insufficient space for another http2 future");
-        };
-
-        // may race with a worker finishing a job
-        let mut bucket_guard = executor.inner.refcounts[self.bucket_index.index as usize]
-            .lock()
-            .unwrap();
-        assert!(*bucket_guard > 0);
-        *bucket_guard += 1;
-
-        *slot = Some(pinned);
-
-        let http2_future_index = Http2FutureIndex {
-            identifier: self.bucket_index.identifier,
-            index: (http2_future_start_index + i) as u32,
-        };
-
-        let io_resources = executor.inner.io_resources;
-        let queue_index = QueueIndex::from_http2_future_index(io_resources, http2_future_index);
-
-        executor.inner.queue.initial_enqueue(queue_index);
-    }
-}
-
-type PinBoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
 struct Inner<F> {
     /// How many queue slots are there per bucket
     io_resources: IoResources,
@@ -134,7 +70,6 @@ struct Inner<F> {
     futures: Box<[Mutex<Option<F>>]>,
     tcp_streams: Box<[AtomicI32]>,
     connections: Box<[Mutex<Slot<Http1Connection>>]>,
-    http2_futures: Box<[Mutex<Option<PinBoxFuture>>]>,
     queue: crate::queue::ComplexQueue,
 }
 
@@ -163,11 +98,6 @@ where
                     .take(connection_count)
                     .collect();
 
-                let http2_future_count = bucket_count * io_resources.http2_futures;
-                let http2_futures = std::iter::repeat_with(|| Mutex::new(None))
-                    .take(http2_future_count)
-                    .collect();
-
                 let queue = ComplexQueue::with_capacity(bucket_count, io_resources);
 
                 let tcp_streams = std::iter::repeat_with(|| AtomicI32::new(0))
@@ -180,7 +110,6 @@ where
                     tcp_streams,
                     refcounts,
                     connections,
-                    http2_futures,
                     queue,
                 };
 
@@ -308,7 +237,6 @@ impl<F> Executor<F> {
         let queue_index = QueueIndex::from_connection_index(io_resources, connection_index);
         let stream = reactor.register(queue_index, stream).unwrap();
 
-        let hyper_executor = HyperExecutor { bucket_index };
         let (sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
 
         let mut connection_lock = self.inner.connections[connection_index.index as usize]
@@ -395,16 +323,12 @@ where
                 IoIndex::InputStream(bucket_index) => {
                     self.poll_input_stream(queue_index, bucket_index)
                 }
-                IoIndex::CustomStream(_) => todo!(),
                 IoIndex::HttpConnection(connection_index) => {
                     match self.poll_http_connection(queue_index, connection_index) {
                         Poll::Ready(HyperWake::Legit) => Poll::Ready(()),
                         Poll::Ready(HyperWake::AfterDeath) => continue 'bucket,
                         Poll::Pending => Poll::Pending,
                     }
-                }
-                IoIndex::Http2Future(future_index) => {
-                    self.poll_http2_future(queue_index, future_index)
                 }
             };
 
@@ -580,36 +504,6 @@ where
         }
 
         Poll::Ready(HyperWake::Legit)
-    }
-
-    fn poll_http2_future(
-        &self,
-        queue_index: QueueIndex,
-        future_index: Http2FutureIndex,
-    ) -> Poll<()> {
-        let mut task_mut = self.http2_futures[future_index.index as usize]
-            .lock()
-            .unwrap();
-
-        let Some(connection) = task_mut.deref_mut() else {
-            log::error!("http2 future in the queue, but there is no future");
-            return Poll::Ready(());
-        };
-
-        let waker = waker_for(queue_index);
-        let mut cx = Context::from_waker(&waker);
-
-        // early return when pending
-        std::task::ready!(connection.as_mut().poll(&mut cx));
-
-        let Some(fut) = task_mut.take() else {
-            panic!("no http2 future");
-        };
-
-        // this _should_ close the underlying TCP stream
-        std::mem::drop(fut);
-
-        Poll::Ready(())
     }
 
     fn set(&self, fd: RawFd, index: BucketIndex, fut: F) {

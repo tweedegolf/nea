@@ -35,9 +35,9 @@ impl QueueSlot {
         self.flags.load(Ordering::Relaxed) == 0
     }
 
-    pub fn mark_empty(&self) {
-        self.flags.store(0, Ordering::Relaxed);
-    }
+    //    pub fn mark_empty(&self) {
+    //        self.flags.store(0, Ordering::Relaxed);
+    //    }
 
     fn try_process(&self) -> Result<(), ()> {
         match self.flags.compare_exchange(
@@ -305,7 +305,7 @@ impl ComplexQueue {
 
         for (i, queue_slot) in it {
             // find a task that is enqueued but not yet in progress
-            let Ok(identifier) = queue_slot.try_process() else {
+            let Ok(_identifier) = queue_slot.try_process() else {
                 // either
                 //
                 // - the slot is empty

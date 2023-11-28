@@ -19,11 +19,11 @@ impl IoResources {
         start..(start + self.http_connections)
     }
 
-    pub(crate) const fn http2_futures(self, bucket_index: BucketIndex) -> Range<usize> {
-        let start = bucket_index.index as usize * self.http2_futures;
-
-        start..(start + self.http2_futures)
-    }
+    //    pub(crate) const fn http2_futures(self, bucket_index: BucketIndex) -> Range<usize> {
+    //        let start = bucket_index.index as usize * self.http2_futures;
+    //
+    //        start..(start + self.http2_futures)
+    //    }
 
     pub(crate) const fn queue_slots(self, bucket_index: BucketIndex) -> Range<QueueIndex> {
         let start_index = bucket_index.index as usize * self.per_bucket();
@@ -126,16 +126,16 @@ impl QueueIndex {
         }
     }
 
-    pub(crate) fn to_http2_future_index(self, io_resources: IoResources) -> Http2FutureIndex {
-        let bucket_index = self.index / io_resources.per_bucket() as u32;
-        let connection = self.index % io_resources.per_bucket() as u32
-            - (io_resources.tcp_streams + io_resources.http_connections) as u32;
-
-        Http2FutureIndex {
-            identifier: self.identifier,
-            index: bucket_index * io_resources.http2_futures as u32 + connection,
-        }
-    }
+    //    pub(crate) fn to_http2_future_index(self, io_resources: IoResources) -> Http2FutureIndex {
+    //        let bucket_index = self.index / io_resources.per_bucket() as u32;
+    //        let connection = self.index % io_resources.per_bucket() as u32
+    //            - (io_resources.tcp_streams + io_resources.http_connections) as u32;
+    //
+    //        Http2FutureIndex {
+    //            identifier: self.identifier,
+    //            index: bucket_index * io_resources.http2_futures as u32 + connection,
+    //        }
+    //    }
 
     pub fn from_bucket_index(io_resources: IoResources, bucket_index: BucketIndex) -> Self {
         Self {
@@ -161,23 +161,23 @@ impl QueueIndex {
         }
     }
 
-    pub(crate) fn from_http2_future_index(
-        io_resources: IoResources,
-        connection_index: Http2FutureIndex,
-    ) -> Self {
-        let bucket_index = connection_index.index / io_resources.http2_futures as u32;
-        let connection = connection_index.index % io_resources.http2_futures as u32;
-
-        let queue_index = bucket_index * io_resources.per_bucket() as u32
-            + io_resources.tcp_streams as u32
-            + io_resources.http_connections as u32
-            + connection;
-
-        Self {
-            identifier: connection_index.identifier,
-            index: queue_index,
-        }
-    }
+    //    pub(crate) fn from_http2_future_index(
+    //        io_resources: IoResources,
+    //        connection_index: Http2FutureIndex,
+    //    ) -> Self {
+    //        let bucket_index = connection_index.index / io_resources.http2_futures as u32;
+    //        let connection = connection_index.index % io_resources.http2_futures as u32;
+    //
+    //        let queue_index = bucket_index * io_resources.per_bucket() as u32
+    //            + io_resources.tcp_streams as u32
+    //            + io_resources.http_connections as u32
+    //            + connection;
+    //
+    //        Self {
+    //            identifier: connection_index.identifier,
+    //            index: queue_index,
+    //        }
+    //    }
 
     pub(crate) fn to_usize(self) -> usize {
         let a = self.index.to_ne_bytes();
@@ -212,11 +212,11 @@ impl QueueIndex {
 pub enum IoIndex {
     // a bucket index
     InputStream(BucketIndex),
-    CustomStream(usize),
+    // CustomStream(usize),
     // an index into the global vector of http connection futures
     HttpConnection(ConnectionIndex),
     // an index into the global vector of http2 futures
-    Http2Future(Http2FutureIndex),
+    // Http2Future(Http2FutureIndex),
 }
 
 impl IoIndex {
@@ -237,7 +237,8 @@ impl IoIndex {
                 IoIndex::HttpConnection(queue_index.to_connection_index(resources))
             }
             n if http2_future_range.contains(&n) => {
-                IoIndex::Http2Future(queue_index.to_http2_future_index(resources))
+                // IoIndex::Http2Future(queue_index.to_http2_future_index(resources))
+                unimplemented!()
             }
             _ => unreachable!(),
         }
