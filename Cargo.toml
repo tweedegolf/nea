@@ -5,4 +5,7 @@ members = [
     "roc_app",
     "nea",
 ]
+exclude = [
+    "benchmarks",
+]
 resolver = "2"

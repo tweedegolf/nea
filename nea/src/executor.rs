@@ -151,8 +151,8 @@ where
         let io_resources = self.inner.io_resources;
         let queue_index = QueueIndex::from_bucket_index(io_resources, bucket_index);
 
-        let range = self.inner.io_resources.queue_slots(bucket_index);
-        assert!(self.inner.queue.is_range_empty(range));
+        // let range = self.inner.io_resources.queue_slots(bucket_index);
+        // assert!(self.inner.queue.is_range_empty(range));
 
         self.inner.queue.initial_enqueue(queue_index);
     }

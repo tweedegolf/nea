@@ -10,7 +10,7 @@ pub struct IoResources {
 impl IoResources {
     #[inline]
     pub(crate) const fn per_bucket(self) -> usize {
-        self.tcp_streams + self.http_connections + self.http2_futures
+        self.tcp_streams + self.http_connections
     }
 
     pub(crate) const fn http_connections(self, bucket_index: BucketIndex) -> Range<usize> {
