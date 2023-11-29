@@ -1,7 +1,29 @@
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use linux_x86_64::{longjmp, setjmp, JumpBuf};
 
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub use macos_x86_64::{longjmp, setjmp, JumpBuf};
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod macos_x86_64 {
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct JumpBuf([usize; 8]);
+
+    impl JumpBuf {
+        pub const fn new() -> Self {
+            Self([0; 8])
+        }
+    }
+
+    extern "C" {
+        pub fn setjmp(env: *mut JumpBuf) -> u32;
+
+        pub fn longjmp(env: *const JumpBuf, ret: u32) -> !;
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux_x86_64 {
     #[repr(C)]
     #[derive(Debug, Clone, Copy)]
