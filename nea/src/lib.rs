@@ -122,6 +122,7 @@ unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
 
         match CURRENT_ARENA.with(|v| v.load(Ordering::Relaxed)) {
             self::ARENA_INDEX_BEFORE_MAIN => {
+                #[cfg(target_os = "linux")]
                 log::info!("bucket ∞: allocating {_size} bytes",);
 
                 match self.0.try_allocate_in_initial_bucket(layout) {
@@ -136,11 +137,11 @@ unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
                     _ => unreachable!(),
                 };
 
-                let id = std::thread::current().id();
-
-                // NOTE: this piece of code runs before main, so before the logger is setup
-                // hence we cannot use `log::*` here!
-                log::info!("thread {id:?}: bucket {bucket_name}: allocating {_size} bytes",);
+                #[cfg(target_os = "linux")]
+                {
+                    let id = std::thread::current().id();
+                    log::info!("thread {id:?}: bucket {bucket_name}: allocating {_size} bytes",);
+                }
 
                 match self.0.try_allocate_in_initial_bucket(layout) {
                     None => std::ptr::null_mut(), // a panic would be UB!
