@@ -80,6 +80,7 @@ pub unsafe extern "C" fn roc_memset(dst: *mut c_void, c: i32, n: usize) -> *mut 
     libc::memset(dst, c, n)
 }
 
+#[derive(Clone)]
 #[repr(C)]
 struct Header {
     key: RocStr,
@@ -101,9 +102,9 @@ async fn handler(
 ) -> std::io::Result<()> {
     let mut buf = [0; 1024];
 
-    let n = tcp_stream.read(&mut buf).await.unwrap();
-
-    let string = std::str::from_utf8(&buf[..n]).unwrap();
+    // leaving 8 zero bytes for future RocStr optimization
+    let n = tcp_stream.read(&mut buf[8..]).await.unwrap();
+    let string = std::str::from_utf8(&buf[8..][..n]).unwrap();
 
     let Some((_headers, body)) = string.split_once("\r\n\r\n") else {
         eprintln!("invalid input");
@@ -121,16 +122,30 @@ async fn handler(
     let version = it.next().unwrap();
     assert!(it.next().is_none());
 
-    println!("{}", _headers);
-
     let mut response = Vec::with_capacity(512);
 
     {
         use std::io::Write;
 
+        // TODO we can turn the whole request into a RocStr and then use seamless slices to be a
+        // bit more efficient here. But most of these fields will be small strings anyway so the
+        // cost is low (also allocation is dirt-cheap with our allocator, so this is probably fine)
+
+        let mut headers = RocList::with_capacity(16);
+        for line in _headers.lines() {
+            let Some((key, value)) = line.split_once(": ") else {
+                continue;
+            };
+
+            let key = RocStr::from(key);
+            let value = RocStr::from(value);
+
+            headers.push(Header { key, value });
+        }
+
         let input = Request {
             body: RocStr::from(body),
-            headers: RocList::empty(),
+            headers,
             method: RocStr::from(method),
             path: RocStr::from(path),
             version: RocStr::from(version),

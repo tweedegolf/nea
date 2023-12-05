@@ -167,8 +167,12 @@ unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
                 }
 
                 match self.0.try_allocate_in_initial_bucket(layout) {
-                    // None => std::ptr::null_mut(), // a panic would be UB!
-                    None => std::alloc::System.alloc(layout),
+                    None => {
+                        // an allocation that is too big for these buckets is almost certainly a
+                        // panic. We want a good backtrace message, so do use the system allocator
+                        // here to collect/store all the information to format the panic message
+                        std::alloc::System.alloc(layout)
+                    }
                     Some(non_null) => non_null.as_ptr(),
                 }
             }
@@ -214,8 +218,6 @@ where
 
     let _handle1 = executor.spawn_worker().unwrap();
     let _handle2 = executor.spawn_worker().unwrap();
-    let _handle3 = executor.spawn_worker().unwrap();
-    let _handle4 = executor.spawn_worker().unwrap();
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = std::net::TcpListener::bind(&addr)?;
