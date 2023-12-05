@@ -13,7 +13,7 @@ main : Request -> Str
 main = \input ->
     when Str.splitFirst input.path "/" is
         Ok { before: _, after } -> 
-            capacity = parseNat after * 1_000
+            capacity = parseNat after * 1024
 
             x : List U8
             x = List.withCapacity capacity
