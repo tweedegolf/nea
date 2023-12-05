@@ -1,4 +1,5 @@
 use std::{
+    alloc::GlobalAlloc,
     cell::RefCell,
     io::ErrorKind,
     os::fd::AsRawFd,
@@ -108,6 +109,28 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
     }
 }
 
+pub unsafe extern "C" fn roc_realloc(
+    ptr: *mut u8,
+    new_size: usize,
+    old_size: usize,
+    alignment: u32,
+) -> NonNull<u8> {
+    let layout = std::alloc::Layout::from_size_align(old_size, alignment as usize).unwrap();
+
+    match NonNull::new(ALLOCATOR.realloc(ptr, layout, new_size)) {
+        None => {
+            let msg = b"out of memory\0";
+            let panic_tag = 1;
+            roc_panic(msg.map(|x| x as std::ffi::c_char).as_ptr(), panic_tag)
+        }
+        Some(ptr) => ptr,
+    }
+}
+
+pub unsafe extern "C" fn roc_dealloc(_ptr: *mut u8, _alignment: u32) {
+    /* do absolutely nothing */
+}
+
 #[global_allocator]
 static ALLOCATOR: ServerAlloc = ServerAlloc(shared::allocator::ServerAlloc::new());
 
@@ -144,7 +167,12 @@ unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
                 }
 
                 match self.0.try_allocate_in_initial_bucket(layout) {
-                    None => std::ptr::null_mut(), // a panic would be UB!
+                    None => {
+                        // an allocation that is too big for these buckets is almost certainly a
+                        // panic. We want a good backtrace message, so do use the system allocator
+                        // here to collect/store all the information to format the panic message
+                        std::alloc::System.alloc(layout)
+                    }
                     Some(non_null) => non_null.as_ptr(),
                 }
             }
@@ -190,7 +218,6 @@ where
 
     let _handle1 = executor.spawn_worker().unwrap();
     let _handle2 = executor.spawn_worker().unwrap();
-    // let _handle3 = executor.spawn_worker().unwrap();
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = std::net::TcpListener::bind(&addr)?;

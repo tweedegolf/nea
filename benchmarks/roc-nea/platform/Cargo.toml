@@ -1,0 +1,21 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2021"
+
+links = "app"
+
+[lib]
+name = "host"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "host"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2.150"
+nea = { path = "../../../nea" }
+roc_std = { path = "/home/folkertdev/roc/roc/crates/roc_std" }
+
