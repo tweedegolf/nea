@@ -5,9 +5,11 @@
 ```shell
 cd rust-tokio
 
-cargo run --example unfavorable
-cargo run --example average
-cargo run --example favorable
+cargo run --example unfavorable --release
+cargo run --example average --release
+cargo run --example favorable --release
+
+siege -c 4 127.0.0.1:8000
 ```
 
 ## Node
@@ -21,4 +23,6 @@ npx tsc
 node . unfavorable
 node . average
 node . favorable
+
+siege -c 4 127.0.0.1:8001
 ```
