@@ -87,6 +87,7 @@ struct Header {
     value: RocStr,
 }
 
+#[derive(Default)]
 #[repr(C)]
 struct Request {
     body: RocStr,
@@ -96,40 +97,19 @@ struct Request {
     version: RocStr,
 }
 
-async fn handler(
-    _bucket_index: nea::index::BucketIndex,
-    tcp_stream: nea::net::TcpStream,
-) -> std::io::Result<()> {
-    let mut buf = [0; 1024];
+impl Request {
+    // TODO we can turn the whole request into a RocStr and then use seamless slices to be a
+    // bit more efficient here. But most of these fields will be small strings anyway so the
+    // cost is low (also allocation is dirt-cheap with our allocator, so this is probably fine)
+    pub fn parse(string: &RocStr) -> Option<Self> {
+        let (_headers, body) = string.split_once("\r\n\r\n")?;
+        let (x, _headers) = string.split_once("\r\n")?;
 
-    // leaving 8 zero bytes for future RocStr optimization
-    let n = tcp_stream.read(&mut buf[8..]).await.unwrap();
-    let string = std::str::from_utf8(&buf[8..][..n]).unwrap();
-
-    let Some((_headers, body)) = string.split_once("\r\n\r\n") else {
-        eprintln!("invalid input");
-        return Ok(());
-    };
-
-    let Some((x, _headers)) = string.split_once("\r\n") else {
-        eprintln!("invalid input");
-        return Ok(());
-    };
-
-    let mut it = x.split_whitespace();
-    let method = it.next().unwrap();
-    let path = it.next().unwrap();
-    let version = it.next().unwrap();
-    assert!(it.next().is_none());
-
-    let mut response = Vec::with_capacity(512);
-
-    {
-        use std::io::Write;
-
-        // TODO we can turn the whole request into a RocStr and then use seamless slices to be a
-        // bit more efficient here. But most of these fields will be small strings anyway so the
-        // cost is low (also allocation is dirt-cheap with our allocator, so this is probably fine)
+        let mut it = x.split_whitespace();
+        let method = it.next()?;
+        let path = it.next()?;
+        let version = it.next()?;
+        assert!(it.next().is_none());
 
         let mut headers = RocList::with_capacity(16);
         for line in _headers.lines() {
@@ -143,23 +123,57 @@ async fn handler(
             headers.push(Header { key, value });
         }
 
-        let input = Request {
-            body: RocStr::from(body),
+        Some(Request {
+            body,
             headers,
             method: RocStr::from(method),
             path: RocStr::from(path),
             version: RocStr::from(version),
-        };
+        })
+    }
+}
+
+pub fn format_response(rust_response: &str) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut response = Vec::with_capacity(512);
+
+    let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
+    let _ = response.write_all(b"Content-Type: text/html\r\n");
+    let _ = response.write_all(b"\r\n");
+    let _ = response.write_all(rust_response.as_bytes());
+    let _ = response.write_all(b"\r\n");
+
+    response
+}
+
+async fn handler(
+    _bucket_index: nea::index::BucketIndex,
+    tcp_stream: nea::net::TcpStream,
+) -> std::io::Result<()> {
+    let mut buf = [0; 1024];
+
+    // leaving 8 zero bytes for future RocStr optimization
+    let n = tcp_stream.read(&mut buf[8..]).await.unwrap();
+
+    // perform utf8 validation
+    std::str::from_utf8(&buf[8..][..n]).unwrap();
+
+    let response = {
+        // # Safety
+        //
+        // - this is valid utf-8
+        // - there is a refcount in front of the pointer
+        // -
+        let roc_str = unsafe { RocStr::from_raw_parts(buf[8..].as_mut_ptr().cast(), n, n) };
+
+        let input = Request::parse(&roc_str).unwrap();
 
         let roc_response = unsafe { mainForHost(&input) };
         std::mem::forget(input);
 
-        let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
-        let _ = response.write_all(b"Content-Type: text/html\r\n");
-        let _ = response.write_all(b"\r\n");
-        let _ = response.write_all(roc_response.as_bytes());
-        let _ = response.write_all(b"\r\n");
-    }
+        format_response(&roc_response)
+    };
 
     let _ = tcp_stream.write(&response).await.unwrap();
 
