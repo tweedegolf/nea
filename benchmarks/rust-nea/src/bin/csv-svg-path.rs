@@ -48,19 +48,3 @@ fn respond(request: &Request) -> Vec<u8> {
 
     format_response(&rust_response)
 }
-
-// main : Str -> Str
-// main = \input ->
-//     input
-//     |> Str.split "\n"
-//     |> List.map \line ->
-//         when Str.split line ", " is
-//             [ xStr, yStr ] -> ( parseNum xStr, parseNum yStr )
-//             _ -> crash "invalid input"
-//     |> List.walk "M 0 0 L" \accum, (x, y) -> "\(accum)\(Num.toStr x) \(Num.toStr y) "
-//     |> \d ->
-//         """
-//         <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
-//           <path d="\(d)" stroke="black" fill="transparent"/>
-//         </svg>
-//         """

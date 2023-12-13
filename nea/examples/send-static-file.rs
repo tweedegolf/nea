@@ -37,5 +37,5 @@ async fn handler(
 }
 
 fn main_for_host(_: &str) -> &'static str {
-    include_str!("/home/folkertdev/rust/nea/platform/Cargo.toml")
+    include_str!("../../Cargo.toml")
 }
