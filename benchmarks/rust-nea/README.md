@@ -1,6 +1,6 @@
 # rust + nea
 
-Benchmarks the performance of a nea platform using a (statically linked) rust request handler.
+Benchmarks the performance of a nea platform using a rust request handler compiled as one compilation unit.
 
 ## Running
 
