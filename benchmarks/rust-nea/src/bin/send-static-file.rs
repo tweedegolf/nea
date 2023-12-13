@@ -23,6 +23,6 @@ async fn handler(
 }
 
 fn respond(_request: &Request) -> Vec<u8> {
-    let rust_response = include_str!("/home/folkertdev/rust/nea/Cargo.toml");
+    let rust_response = include_str!("../../Cargo.toml");
     format_response(rust_response)
 }
