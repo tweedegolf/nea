@@ -17,5 +17,5 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2.150"
 nea = { path = "../../../nea" }
-roc_std = { path = "/home/folkertdev/roc/roc/crates/roc_std" }
+roc_std = { path = "../roc_std" }
 
