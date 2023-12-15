@@ -1,9 +1,10 @@
-use rust_tokio::{Request, Response};
 use std::fmt::Write;
 
-#[tokio::main]
+use rust_tokio::{request::Request, response::Response, server};
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    rust_tokio::serve(average).await.unwrap();
+    server::serve(average).await.unwrap();
 }
 
 pub async fn average<'r>(request: Request<'r>) -> Response {

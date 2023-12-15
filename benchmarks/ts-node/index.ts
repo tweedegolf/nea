@@ -1,7 +1,7 @@
 import * as net from 'net';
 import {Request} from "./types";
 
-const PORT = 8001;
+const PORT = 8000;
 const handlerName = process.argv[2] || 'average';
 const handlerModule = require(`./handlers/${handlerName}`);
 

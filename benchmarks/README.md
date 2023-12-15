@@ -1,6 +1,10 @@
 # Nea Benchmarks
 
-## Tokio
+```shell
+siege -c 4 -b -i -f urls.txt
+```
+
+## Rust / Tokio
 
 ```shell
 cd rust-tokio
@@ -8,21 +12,19 @@ cd rust-tokio
 cargo run --example unfavorable --release
 cargo run --example average --release
 cargo run --example favorable --release
-
-siege -c 4 127.0.0.1:8000
 ```
 
-## Node
+## TypeScript / Node
 
 ```shell
 cd ts-node
 
-# Compile TypeScript
+npm install
 npx tsc
+
+export UV_THREADPOOL_SIZE=2
 
 node . unfavorable
 node . average
 node . favorable
-
-siege -c 4 127.0.0.1:8001
 ```
