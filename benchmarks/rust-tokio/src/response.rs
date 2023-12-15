@@ -1,5 +1,7 @@
-use std::fmt::{Display, Formatter};
-use std::num::NonZeroU16;
+use std::{
+    fmt::{Display, Formatter},
+    num::NonZeroU16,
+};
 
 #[derive(Debug)]
 pub struct Response {
@@ -44,6 +46,7 @@ pub struct ContentType(&'static str);
 
 impl ContentType {
     pub const TEXT_PLAIN: ContentType = ContentType("text/plain");
+    pub const IMAGE_SVG: ContentType = ContentType("image/svg+xml");
 }
 
 impl Display for ContentType {

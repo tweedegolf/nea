@@ -1,6 +1,10 @@
 use std::fmt::Write;
 
-use rust_tokio::{request::RequestBuf, response::Response, server};
+use rust_tokio::{
+    request::RequestBuf,
+    response::{ContentType, Response, StatusCode},
+    server,
+};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
@@ -25,10 +29,13 @@ pub async fn average(request: RequestBuf) -> Response {
             acc
         });
 
-    format!(
-        r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+    Response {
+        content_type: ContentType::IMAGE_SVG,
+        body: format!(
+            r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
     <path d="{path}" stroke="black" fill="transparent"/>
 </svg>"#
-    )
-    .into()
+        ),
+        status: StatusCode::OK,
+    }
 }

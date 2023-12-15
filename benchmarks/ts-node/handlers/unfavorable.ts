@@ -3,7 +3,17 @@ import { Request, Response } from '../types';
 export const handleRequest = (request: Request): Response => {
 	return {
 		statusCode: '200 OK',
-		contentType: 'text/plain',
+		contentType: '[workspace]\n' +
+			'members = [ \n' +
+			'    "log",\n' +
+			'    "shared",\n' +
+			'    "roc_app",\n' +
+			'    "nea",\n' +
+			']\n' +
+			'exclude = [\n' +
+			'    "benchmarks",\n' +
+			']\n' +
+			'resolver = "2"\n',
 		body: 'Hello, World!'
 	};
 };

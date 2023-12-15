@@ -8,5 +8,5 @@ async fn main() {
 pub async fn unfavorable(request: RequestBuf) -> Response {
     let _request = request.as_request().unwrap();
 
-    include_str!("../../Cargo.toml").into()
+    include_str!("../../../../Cargo.toml").into()
 }
