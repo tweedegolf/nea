@@ -1,13 +1,15 @@
 use std::hint;
 
-use rust_tokio::{request::Request, response::Response, server};
+use rust_tokio::{request::RequestBuf, response::Response, server};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     server::serve(favorable).await.unwrap();
 }
 
-pub async fn favorable(_request: Request<'_>) -> Response {
+pub async fn favorable(request: RequestBuf) -> Response {
+    let _request = request.as_request().unwrap();
+
     let mut vecs = hint::black_box(Vec::new());
 
     for i in 0..100 {

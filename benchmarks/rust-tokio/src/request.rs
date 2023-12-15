@@ -1,6 +1,19 @@
-use std::collections::BTreeMap;
-use std::error::Error;
-use std::fmt::Display;
+use std::{collections::BTreeMap, error::Error, fmt::Display};
+
+#[derive(Debug)]
+pub struct RequestBuf {
+    content: String,
+}
+
+impl RequestBuf {
+    pub fn new(content: String) -> Self {
+        RequestBuf { content }
+    }
+
+    pub fn as_request(&self) -> Result<Request<'_>, ParseRequestError> {
+        Request::from_str(&self.content)
+    }
+}
 
 #[derive(Debug)]
 pub struct Request<'r> {
@@ -12,8 +25,8 @@ pub struct Request<'r> {
 }
 
 impl<'r> Request<'r> {
-    pub fn from_str(input: &'r str) -> Result<Self, ParseRequestError> {
-        let (headers, body) = input
+    pub fn from_str(content: &'r str) -> Result<Self, ParseRequestError> {
+        let (headers, body) = content
             .split_once("\r\n\r\n")
             .ok_or(ParseRequestError::Syntax)?;
 

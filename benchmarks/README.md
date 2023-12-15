@@ -9,9 +9,9 @@ siege -c 4 -b -i -f urls.txt
 ```shell
 cd rust-tokio
 
-cargo run --example unfavorable --release
-cargo run --example average --release
-cargo run --example favorable --release
+cargo run --bin unfavorable --release
+cargo run --bin average --release
+cargo run --bin favorable --release
 ```
 
 ## TypeScript / Node

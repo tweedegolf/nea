@@ -6,7 +6,7 @@ use std::{
 
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::{error::Result, request::Request, response::Response};
+use crate::{error::Result, request::RequestBuf, response::Response};
 
 const HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const PORT: u16 = 8000;
@@ -15,7 +15,7 @@ const ADDRESS: SocketAddr = SocketAddr::new(HOST, PORT);
 
 pub async fn serve<F, Fut>(handler: F) -> Result<()>
 where
-    for<'r> F: Fn(Request<'r>) -> Fut,
+    F: Fn(RequestBuf) -> Fut,
     Fut: Future<Output = Response>,
 {
     let listener = TcpListener::bind(ADDRESS).await?;
@@ -27,7 +27,7 @@ where
 
 async fn worker<F, Fut>(listener: &TcpListener, mut handler: F) -> Result<()>
 where
-    for<'r> F: FnMut(Request<'r>) -> Fut,
+    F: FnMut(RequestBuf) -> Fut,
     Fut: Future<Output = Response>,
 {
     while let Ok((stream, _addr)) = listener.accept().await {
@@ -39,7 +39,7 @@ where
 
         // Parse request
         let request = std::str::from_utf8(&buf)?;
-        let request = Request::from_str(request)?;
+        let request = RequestBuf::new(request.to_owned());
 
         // Handle request
         let response = handler(request).await;

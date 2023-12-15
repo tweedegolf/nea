@@ -1,13 +1,15 @@
 use std::fmt::Write;
 
-use rust_tokio::{request::Request, response::Response, server};
+use rust_tokio::{request::RequestBuf, response::Response, server};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     server::serve(average).await.unwrap();
 }
 
-pub async fn average<'r>(request: Request<'r>) -> Response {
+pub async fn average(request: RequestBuf) -> Response {
+    let request = request.as_request().unwrap();
+
     let path = request
         .body
         .lines()
