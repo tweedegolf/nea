@@ -60,7 +60,10 @@ async fn read_request(stream: &TcpStream, buf: &mut [u8]) -> Result<()> {
         match stream.try_read(&mut buf[bytes_read..]) {
             Ok(0) => return Ok(()),
             Ok(n) => bytes_read += n,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+            // FIXME: This returns Ok because curl doesn't close the connection after writing,
+            //  resulting in an infinite loop. The benchmark requests will probably finish
+            //  before blocking anyway, so it's not a big problem for now.
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e.into()),
         }
     }
