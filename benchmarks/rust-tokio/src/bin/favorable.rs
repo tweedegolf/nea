@@ -8,16 +8,14 @@ async fn main() {
 }
 
 pub async fn favorable(request: RequestBuf) -> Response {
-    let _request = request.as_request().unwrap();
+    let request = request.as_request().unwrap();
 
-    let mut vecs = hint::black_box(Vec::new());
-
-    for i in 0..100 {
-        let vec5000: Vec<u8> = hint::black_box(vec![0xaa; 5000 + i]);
-        let vec10000: Vec<u8> = hint::black_box(vec![0xaa; 10000]);
-        vecs.push(vec10000);
-        drop(vec5000);
+    match request.path.split_once('/') {
+        None => panic!("invalid input"),
+        Some((_, after)) => {
+            let capacity = after.parse::<usize>().unwrap() * 1024;
+            let x: Vec<u8> = hint::black_box(Vec::with_capacity(capacity));
+            x.len().to_string().into()
+        }
     }
-
-    "Hello, World!".into()
 }
