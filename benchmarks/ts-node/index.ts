@@ -10,12 +10,12 @@ const server = net.createServer((socket) => {
 		const requestString = data.toString();
 
 		// Basic parsing of the request
-		const [requestLine, remainder] = requestString.split('\r\n', 2);
-		const [method, path, version] = requestLine.split(' ');
+		const [headerLines, body] = requestString.split('\r\n\r\n', 2);
+		const lines = headerLines.split('\r\n');
+		const [method, path, version] = lines[0].split(' ');
 		const headers = new Map<string, string>();
-		const [headerLines, body] = remainder.split('\r\n\r\n', 2);
-		for (const line of headerLines.split('\r\n')) {
-			const [key, value] = line.split(': ');
+		for (const line of lines.slice(1)) {
+			const [key, value] = line.split(': ', 2);
 			headers.set(key, value);
 		}
 

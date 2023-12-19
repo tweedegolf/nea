@@ -1,7 +1,7 @@
 # Nea Benchmarks
 
 ```shell
-siege -c 4 -b -i -f ../urls.txt
+siege -c 4 -b -i -f ../urls.txt -r 10000
 ```
 
 ## Rust / Tokio
