@@ -1,9 +1,10 @@
-import { Request, Response } from '../types';
+import {Request, Response} from '../types';
 
 export const handleRequest = async (request: Request): Promise<Response> => {
 	return {
 		statusCode: '200 OK',
-		contentType: '[workspace]\n' +
+		contentType: 'text/plain',
+		body: '[workspace]\n' +
 			'members = [ \n' +
 			'    "log",\n' +
 			'    "shared",\n' +
@@ -14,6 +15,5 @@ export const handleRequest = async (request: Request): Promise<Response> => {
 			'    "benchmarks",\n' +
 			']\n' +
 			'resolver = "2"\n',
-		body: 'Hello, World!'
 	};
 };
