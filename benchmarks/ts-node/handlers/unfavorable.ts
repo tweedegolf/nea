@@ -1,6 +1,6 @@
 import { Request, Response } from '../types';
 
-export const handleRequest = (request: Request): Response => {
+export const handleRequest = async (request: Request): Promise<Response> => {
 	return {
 		statusCode: '200 OK',
 		contentType: '[workspace]\n' +

@@ -12,4 +12,8 @@ export type Response = {
 	statusCode: string;
 };
 
-export type RequestHandler = (request: Request) => Response;
+export type Service = {
+	handleRequest: RequestHandler;
+};
+
+export type RequestHandler = (request: Request) => Promise<Response>;

@@ -1,6 +1,6 @@
 import { Request, Response } from '../types';
 
-export const handleRequest = (request: Request): Response => {
+export const handleRequest = async (request: Request): Promise<Response> => {
 	const lines = request.body.split('\n');
 	let path = 'M 0 0 L';
 
