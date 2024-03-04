@@ -1,0 +1,11 @@
+[workspace]
+members = [ 
+    "log",
+    "shared",
+    "roc_app",
+    "nea",
+]
+exclude = [
+    "benchmarks",
+]
+resolver = "2"
