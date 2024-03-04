@@ -1,6 +1,6 @@
 app "nea-test"
     packages { pf: "platform/main.roc" }
-    imports []
+    imports [pf.Request.{ Request }]
     provides [main] to pf
 
 parseNum : Str -> U32
@@ -9,9 +9,9 @@ parseNum = \input ->
         Ok v -> v
         Err _ -> crash "invalid input"
 
-main : Str -> Str
+main : Request -> Str
 main = \input ->
-    input 
+    input.body
     |> Str.split "\n" 
     |> List.map \line -> 
         when Str.split line ", " is
