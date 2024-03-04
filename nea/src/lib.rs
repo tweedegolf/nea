@@ -97,7 +97,7 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
 
     let size = layout.size();
 
-    eprintln!("arena {bucket_index}: allocating {size} bytes",);
+    // eprintln!("arena {bucket_index}: allocating {size} bytes",);
 
     match ALLOCATOR.0.try_allocate_in_bucket(layout, bucket_index) {
         None => {
@@ -217,6 +217,8 @@ where
     let reactor = Reactor::get_or_init(config.bucket_count, config.io_resources).unwrap();
 
     let _handle1 = executor.spawn_worker().unwrap();
+    let _handle2 = executor.spawn_worker().unwrap();
+    let _handle2 = executor.spawn_worker().unwrap();
     let _handle2 = executor.spawn_worker().unwrap();
 
     let addr = format!("{}:{}", config.host, config.port);

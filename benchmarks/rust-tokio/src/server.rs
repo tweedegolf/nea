@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::{error::Result, request::RequestBuf, response::Response};
 
 const HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-const PORT: u16 = 8000;
+const PORT: u16 = 8080;
 
 const ADDRESS: SocketAddr = SocketAddr::new(HOST, PORT);
 
@@ -19,6 +19,7 @@ where
     Fut: Future<Output = Response>,
 {
     let listener = TcpListener::bind(ADDRESS).await?;
+    println!("listening on {ADDRESS:?}");
 
     worker(&listener, handler).await?;
 
