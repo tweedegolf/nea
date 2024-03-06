@@ -136,7 +136,7 @@ impl Request {
 pub fn format_response(rust_response: &str) -> Vec<u8> {
     use std::io::Write;
 
-    let mut response = Vec::with_capacity(512);
+    let mut response = Vec::with_capacity(4096);
 
     let _ = response.write_all(b"HTTP/1.1 200 OK\r\n");
     let _ = response.write_all(b"Content-Type: text/html\r\n");
@@ -151,13 +151,15 @@ async fn handler(
     _bucket_index: nea::index::BucketIndex,
     tcp_stream: nea::net::TcpStream,
 ) -> std::io::Result<()> {
-    let mut buf = [0; 1024];
+    let mut buf = [0; 4096];
 
     // leaving 8 zero bytes for future RocStr optimization
     let n = tcp_stream.read(&mut buf[8..]).await.unwrap();
 
     // perform utf8 validation
     std::str::from_utf8(&buf[8..][..n]).unwrap();
+
+    assert!(8 + n < buf.len());
 
     let response = {
         // # Safety
