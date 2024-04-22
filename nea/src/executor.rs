@@ -444,7 +444,7 @@ where
     fn cleanup_bucket(&self, bucket_index: BucketIndex, reason: CleanupReason) {
         // send back an http error response
         let socket_index = QueueIndex::from_bucket_index(self.io_resources, bucket_index);
-        let raw_fd = self.tcp_streams[socket_index.index as usize].load(Ordering::Relaxed);
+        let raw_fd = self.tcp_streams[bucket_index.index as usize].load(Ordering::Relaxed);
 
         // SAFETY: We just turned this into a raw fd from an OwnedFd
         let socket_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
@@ -466,8 +466,15 @@ where
         // clean up the memory
         ALLOCATOR.0.clear_bucket(bucket_index.index as usize);
 
+        assert!(self.futures[socket_index.index as usize]
+            .lock()
+            .unwrap()
+            .is_none());
+
         // signals that this bucket is now free for the next request
         *self.refcounts[bucket_index.index as usize].lock().unwrap() = 0;
+
+        dbg!("Done with", bucket_index);
     }
 
     fn run_worker(&self) -> ! {
@@ -524,7 +531,10 @@ where
         assert!(old.is_some());
 
         // Also drop the TcpStream
-        let raw_fd = self.tcp_streams[queue_index.index as usize].load(Ordering::Relaxed);
+        let bucket_idx = queue_index.to_bucket_index(self.io_resources);
+        let new_queue_index = QueueIndex::from_bucket_index(self.io_resources, bucket_idx);
+
+        let raw_fd = self.tcp_streams[bucket_idx.index as usize].load(Ordering::Relaxed);
 
         // SAFETY: We just turned this into a raw fd from an OwnedFd
         let _ = unsafe { OwnedFd::from_raw_fd(raw_fd) };
@@ -576,11 +586,11 @@ where
             .unwrap()
             .replace(fut);
 
+        assert!(old_value.is_none(), "Bucket {index:?} is not empty!");
+
         self.tcp_streams[index.index as usize].store(fd.into_raw_fd(), Ordering::Relaxed);
 
         // NOTE try_claim already set the refcount of this slot to 1
-
-        assert!(old_value.is_none(), "Bucket {index:?} was empty!")
     }
 
     fn try_claim(&self) -> Option<BucketIndex> {
@@ -595,6 +605,7 @@ where
             }
             Err(_) => false,
         })?;
+        dbg!(bucket_index);
 
         let index = bucket_index as u32;
         let identifier = 0;

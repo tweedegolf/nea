@@ -1,3 +1,4 @@
+use std::sync::MutexGuard;
 use std::{
     alloc::GlobalAlloc,
     cell::RefCell,
@@ -140,6 +141,11 @@ struct ServerAlloc(shared::allocator::ServerAlloc);
 
 unsafe impl std::alloc::GlobalAlloc for ServerAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if std::thread::panicking() {
+            // Well if we are panicking we just leak memory...
+            return std::alloc::System.alloc(layout);
+        }
+
         let _size = layout.size();
 
         match CURRENT_ARENA.with(|v| v.load(Ordering::Relaxed)) {
