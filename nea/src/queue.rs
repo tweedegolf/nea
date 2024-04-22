@@ -1,4 +1,3 @@
-use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -30,14 +29,6 @@ impl QueueSlot {
             jobs: AtomicU64::new(0),
         }
     }
-
-    fn is_empty(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) == 0
-    }
-
-    //    pub fn mark_empty(&self) {
-    //        self.flags.store(0, Ordering::Relaxed);
-    //    }
 
     fn try_process(&self) -> Result<(), ()> {
         match self.flags.compare_exchange(
@@ -183,16 +174,6 @@ impl ComplexQueue {
 
     fn wait_jobs_available(&self) -> u32 {
         self.jobs_in_queue.wait_active()
-    }
-
-    pub fn is_range_empty(&self, range: Range<QueueIndex>) -> bool {
-        for slot in &self.queue[range.start.index as usize..range.end.index as usize] {
-            if !slot.is_empty() {
-                return false;
-            }
-        }
-
-        true
     }
 
     /// Wake an existing task by putting it back into the queue

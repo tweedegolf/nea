@@ -4,18 +4,18 @@
 use std::{
     future::Future,
     ops::DerefMut,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     sync::{
         atomic::{AtomicI32, AtomicU32, Ordering},
-        Mutex, MutexGuard, OnceLock, TryLockError, TryLockResult,
+        Mutex, MutexGuard, OnceLock,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 use shared::setjmp_longjmp::{setjmp, JumpBuf};
 
-pub use crate::index::{BucketIndex, ConnectionIndex, Http2FutureIndex, IoIndex, QueueIndex};
+pub use crate::index::{BucketIndex, ConnectionIndex, IoIndex, QueueIndex};
 use crate::{
     index::IoResources,
     queue::{ComplexQueue, NextStep, QueueSlot},
@@ -340,7 +340,7 @@ where
                                 self.poll_input_stream(task_mut, queue_index)
                             }) {
                                 Err(_) => {
-                                    /* the application went panicked */
+                                    /* the application panicked */
                                     let thread = std::thread::current().id();
                                     let bucket = bucket_index.index;
                                     log::error!("{thread:?}: emptying bucket {bucket} after panic");

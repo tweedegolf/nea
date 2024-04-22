@@ -60,7 +60,7 @@ thread_local! {
     ///
     /// The value is an atomic because that makes updating the value easier. This is a
     /// thread-local, so race conditions are not possible!
-    pub(crate) static CURRENT_ARENA: AtomicU32 = AtomicU32::new(ARENA_INDEX_BEFORE_MAIN);
+    pub(crate) static CURRENT_ARENA: AtomicU32 = const { AtomicU32::new(ARENA_INDEX_BEFORE_MAIN) };
 }
 
 /// Function called when the applications hits a (from its perspective) unrecoverable error.
@@ -91,13 +91,8 @@ pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! 
 /// Should only be called after a thread has set its arena
 pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
     let bucket_index = CURRENT_ARENA.with(|v| v.load(Ordering::Relaxed)) as usize;
-    assert!(bucket_index < 1000);
 
     let layout = std::alloc::Layout::from_size_align(size, alignment as usize).unwrap();
-
-    let size = layout.size();
-
-    // eprintln!("arena {bucket_index}: allocating {size} bytes",);
 
     match ALLOCATOR.0.try_allocate_in_bucket(layout, bucket_index) {
         None => {
@@ -109,6 +104,8 @@ pub unsafe extern "C" fn roc_alloc(size: usize, alignment: u32) -> NonNull<u8> {
     }
 }
 
+/// # Safety
+/// Same as the [GlobalAlloc::realloc]
 pub unsafe extern "C" fn roc_realloc(
     ptr: *mut u8,
     new_size: usize,
@@ -127,6 +124,8 @@ pub unsafe extern "C" fn roc_realloc(
     }
 }
 
+/// # Safety
+/// Same as the [GlobalAlloc::dealloc]
 pub unsafe extern "C" fn roc_dealloc(_ptr: *mut u8, _alignment: u32) {
     /* do absolutely nothing */
 }
