@@ -1,8 +1,7 @@
 [workspace]
-members = [ 
+members = [
     "log",
     "shared",
-    "roc_app",
     "nea",
 ]
 exclude = [
