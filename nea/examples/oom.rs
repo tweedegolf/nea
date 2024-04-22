@@ -12,7 +12,7 @@ async fn handler(
 
     let string = std::str::from_utf8(&buf[..n]).unwrap();
 
-    let num_str = &string.split_whitespace().skip(1).next().unwrap()[1..];
+    let num_str = &string.split_whitespace().nth(1).unwrap()[1..];
     let num = num_str.parse::<usize>().unwrap();
 
     let kbs = num;

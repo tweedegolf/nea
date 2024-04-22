@@ -18,28 +18,6 @@ impl IoResources {
 
         start..(start + self.http_connections)
     }
-
-    //    pub(crate) const fn http2_futures(self, bucket_index: BucketIndex) -> Range<usize> {
-    //        let start = bucket_index.index as usize * self.http2_futures;
-    //
-    //        start..(start + self.http2_futures)
-    //    }
-
-    pub(crate) const fn queue_slots(self, bucket_index: BucketIndex) -> Range<QueueIndex> {
-        let start_index = bucket_index.index as usize * self.per_bucket();
-
-        let start = QueueIndex {
-            identifier: 0,
-            index: start_index as _,
-        };
-
-        let end = QueueIndex {
-            identifier: 0,
-            index: (start_index + self.per_bucket()) as _,
-        };
-
-        start..end
-    }
 }
 
 impl Default for IoResources {
