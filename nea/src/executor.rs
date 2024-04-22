@@ -523,6 +523,12 @@ where
         let old = task_mut.take();
         assert!(old.is_some());
 
+        // Also drop the TcpStream
+        let raw_fd = self.tcp_streams[queue_index.index as usize].load(Ordering::Relaxed);
+
+        // SAFETY: We just turned this into a raw fd from an OwnedFd
+        let _ = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
         Poll::Ready(())
     }
 
