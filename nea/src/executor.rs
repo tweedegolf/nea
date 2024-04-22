@@ -4,11 +4,11 @@
 use std::{
     future::Future,
     ops::DerefMut,
-    os::fd::{FromRawFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     pin::Pin,
     sync::{
         atomic::{AtomicI32, AtomicU32, Ordering},
-        Mutex, MutexGuard, OnceLock,
+        Mutex, MutexGuard, OnceLock, TryLockError, TryLockResult,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
@@ -145,7 +145,7 @@ where
         self.inner.try_claim()
     }
 
-    pub fn execute(&self, fd: RawFd, bucket_index: BucketIndex, fut: F) {
+    pub fn execute(&self, fd: OwnedFd, bucket_index: BucketIndex, fut: F) {
         self.inner.set(fd, bucket_index, fut);
 
         let io_resources = self.inner.io_resources;
@@ -271,19 +271,35 @@ enum DoneWithBucket {
     ForNow,
     Forever,
     OutOfMemory,
+    Panic,
 }
 
-fn send_out_of_memory_response(mut socket: std::net::TcpStream) -> std::io::Result<()> {
+enum CleanupReason {
+    OutOfMemory,
+    Panic,
+}
+
+fn send_error_response(
+    mut socket: std::net::TcpStream,
+    reason: CleanupReason,
+) -> std::io::Result<()> {
     use std::io::Write;
 
     socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\n")?;
     socket.write_all(b"Content-Type: text/plain\r\n")?;
     socket.write_all(b"\r\n")?;
-    socket.write_all(b"Internal Server Error: Out of Memory\r\n")?;
+    match reason {
+        CleanupReason::OutOfMemory => {
+            socket.write_all(b"Internal Server Error: Out of Memory\r\n")?;
+        }
+        CleanupReason::Panic => {
+            socket.write_all(b"Internal Server Error: Panic\r\n")?;
+        }
+    }
     socket.flush()?;
 
     // a proper shutdown of the connection. We don't need a Content-Length header
-    // if we close the connetion in this way
+    // if we close the connection in this way
     socket.shutdown(std::net::Shutdown::Write)
 }
 
@@ -320,7 +336,25 @@ where
                     match unsafe { setjmp(&mut jmp_buf) } {
                         0 => {
                             crate::JMP_BUFFER.with_borrow_mut(|jb| *jb = jmp_buf);
-                            self.poll_input_stream(task_mut, queue_index)
+                            match std::panic::catch_unwind(|| {
+                                self.poll_input_stream(task_mut, queue_index)
+                            }) {
+                                Err(_) => {
+                                    /* the application went panicked */
+                                    let thread = std::thread::current().id();
+                                    let bucket = bucket_index.index;
+                                    log::error!("{thread:?}: emptying bucket {bucket} after panic");
+
+                                    // Clear the poison, since we only gonna clean up anyway...
+                                    self.futures[bucket_index.index as usize].clear_poison();
+
+                                    self.cleanup_bucket(bucket_index, CleanupReason::Panic);
+
+                                    // everything has been cleaned up. This thread is ready for the next request
+                                    return DoneWithBucket::Panic;
+                                }
+                                Ok(poll) => poll,
+                            }
                         }
                         _ => {
                             /* the application went Out Of Memory */
@@ -331,7 +365,7 @@ where
                             // free the mutex so cleanup can clean it up
                             drop(task_mut);
 
-                            self.cleanup_bucket(bucket_index);
+                            self.cleanup_bucket(bucket_index, CleanupReason::OutOfMemory);
 
                             // everything has been cleaned up. This thread is ready for the next request
                             return DoneWithBucket::OutOfMemory;
@@ -360,7 +394,7 @@ where
                             // free the mutex so cleanup can clean it up
                             drop(task_mut);
 
-                            self.cleanup_bucket(bucket_index);
+                            self.cleanup_bucket(bucket_index, CleanupReason::OutOfMemory);
 
                             // everything has been cleaned up. This thread is ready for the next request
                             return DoneWithBucket::OutOfMemory;
@@ -407,13 +441,16 @@ where
         }
     }
 
-    fn cleanup_bucket(&self, bucket_index: BucketIndex) {
+    fn cleanup_bucket(&self, bucket_index: BucketIndex, reason: CleanupReason) {
         // send back an http error response
         let socket_index = QueueIndex::from_bucket_index(self.io_resources, bucket_index);
-        let socket_fd = self.tcp_streams[socket_index.index as usize].load(Ordering::Relaxed);
+        let raw_fd = self.tcp_streams[socket_index.index as usize].load(Ordering::Relaxed);
 
-        let socket = unsafe { std::net::TcpStream::from_raw_fd(socket_fd) };
-        let _ = send_out_of_memory_response(socket);
+        // SAFETY: We just turned this into a raw fd from an OwnedFd
+        let socket_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        let socket = std::net::TcpStream::from(socket_fd);
+        let _ = send_error_response(socket, reason);
 
         // drop all the http connections (should clean up mio registration?)
         for index in self.io_resources.http_connections(bucket_index) {
@@ -458,7 +495,7 @@ where
                             }
                         }
                     }
-                    DoneWithBucket::OutOfMemory => continue,
+                    DoneWithBucket::OutOfMemory | DoneWithBucket::Panic => continue,
                 }
             }
         }
@@ -527,17 +564,17 @@ where
         Poll::Ready(HyperWake::Legit)
     }
 
-    fn set(&self, fd: RawFd, index: BucketIndex, fut: F) {
+    fn set(&self, fd: OwnedFd, index: BucketIndex, fut: F) {
         let old_value = self.futures[index.index as usize]
             .try_lock()
             .unwrap()
             .replace(fut);
 
-        self.tcp_streams[index.index as usize].store(fd, Ordering::Relaxed);
+        self.tcp_streams[index.index as usize].store(fd.into_raw_fd(), Ordering::Relaxed);
 
         // NOTE try_claim already set the refcount of this slot to 1
 
-        assert!(old_value.is_none())
+        assert!(old_value.is_none(), "Bucket {index:?} was empty!")
     }
 
     fn try_claim(&self) -> Option<BucketIndex> {
