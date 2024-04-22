@@ -16,6 +16,13 @@ This is, of course, a tradeoff. It assumes that the request handling takes a dec
 
 But in return you get a very reliable system: peak memory use is average memory use, there will never be any global garbage collection pauses, and when a particular request does exceed its memory limit, only that request gets cancelled (by sending a proper http error).
 
+
+## Prerequisites
+
+```shell
+sudo apt install mold
+```
+
 ## Examples
 
 There are currently three examples that showcase functionality. Examples can be run with cargo, e.g. `cargo run --example hyper`. 
