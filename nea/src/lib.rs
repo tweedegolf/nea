@@ -232,7 +232,10 @@ where
     for (i, stream) in listener.incoming().enumerate() {
         let stream = stream.unwrap();
         stream.set_nonblocking(true).unwrap();
-        let fd = stream.as_raw_fd();
+
+        // Clone the TcpStream socket, so that we still have a handle to send an error response in
+        // case of panic or OOM
+        let fd = stream.try_clone().expect("we never run out of FDs").into();
 
         match executor.try_claim() {
             None => {
@@ -243,8 +246,9 @@ where
             Some(bucket_index) => {
                 executor.execute(fd, bucket_index, async move {
                     log::info!(
-                        "new connection {i} (index = {}, fd = {fd})",
-                        bucket_index.index
+                        "new connection {i} (index = {}, fd = {})",
+                        bucket_index.index,
+                        stream.as_raw_fd()
                     );
 
                     let queue_index =
