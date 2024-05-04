@@ -26,7 +26,7 @@ fn respond(request: &Request) -> Vec<u8> {
     let n = request.path[1..].parse::<usize>().unwrap();
     let capacity = n * 1024;
 
-    let v = vec![0xAA; capacity];
+    let v = vec![0xAAu8; capacity];
 
     format_response(&format!("{}", v.len()))
 }
