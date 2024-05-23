@@ -16,7 +16,7 @@ main = \input ->
             capacity = parseU64 after * 1024
 
             x : List U8
-            x = List.withCapacity capacity
+            x = List.repeat 0xAA capacity
 
             Num.toStr (List.len x)
 
