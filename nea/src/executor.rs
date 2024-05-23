@@ -443,8 +443,8 @@ where
 
     fn cleanup_bucket(&self, bucket_index: BucketIndex, reason: CleanupReason) {
         // send back an http error response
-        let socket_index = QueueIndex::from_bucket_index(self.io_resources, bucket_index);
-        let raw_fd = self.tcp_streams[socket_index.index as usize].load(Ordering::Relaxed);
+        // let socket_index = QueueIndex::from_bucket_index(self.io_resources, bucket_index);
+        let raw_fd = self.tcp_streams[bucket_index.index as usize].load(Ordering::Relaxed);
 
         // SAFETY: We just turned this into a raw fd from an OwnedFd
         let socket_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
@@ -458,7 +458,7 @@ where
         }
 
         // drop the main future
-        let _ = self.futures[socket_index.index as usize]
+        let _ = self.futures[bucket_index.index as usize]
             .lock()
             .unwrap()
             .take();
@@ -524,7 +524,8 @@ where
         assert!(old.is_some());
 
         // Also drop the TcpStream
-        let raw_fd = self.tcp_streams[queue_index.index as usize].load(Ordering::Relaxed);
+        let bucket_index = queue_index.to_bucket_index(self.io_resources);
+        let raw_fd = self.tcp_streams[bucket_index.index as usize].load(Ordering::Relaxed);
 
         // SAFETY: We just turned this into a raw fd from an OwnedFd
         let _ = unsafe { OwnedFd::from_raw_fd(raw_fd) };
