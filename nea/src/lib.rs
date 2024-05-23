@@ -78,7 +78,7 @@ pub unsafe extern "C" fn roc_panic(message_ptr: *const i8, panic_tag: u32) -> ! 
     let message_cstr = unsafe { std::ffi::CStr::from_ptr(message_ptr) };
     let message = message_cstr.to_str().unwrap();
 
-    eprintln!("thread {thread_id:?} hit a panic {panic_tag}: {message}");
+    eprintln!("thread {thread_id:?} called roc_panic {panic_tag}: {message}");
 
     let jmp_buf = JMP_BUFFER.with_borrow(|jmp_buf| *jmp_buf);
     unsafe { longjmp(&jmp_buf, 1) }
