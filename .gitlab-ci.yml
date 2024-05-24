@@ -19,5 +19,5 @@ benchmark:
     - runner roc-nea csv-svg-path
   artifacts:
     paths:
-      - "*.json"
+      - "/nea/*.json"
 
