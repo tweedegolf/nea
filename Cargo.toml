@@ -3,6 +3,7 @@ members = [
     "log",
     "shared",
     "nea",
+    "runner",
 ]
 exclude = [
     "benchmarks",

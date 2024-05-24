@@ -1,0 +1,20 @@
+stages:
+  - build
+
+variables:
+  DOCKER_DRIVER: overlay
+  EXPORT_DOCKER_ON: "domain.com"
+  BUILD_PACKAGES_ON: "domain.com"
+
+benchmark:
+  stage: build
+  tags: [docker]
+  image: registry.gitlab.com/software-energy-lab/nea:latest
+  script:
+    - runner go csv-svg-path
+    - runner rust-nea csv-svg-path
+    - runner roc-nea csv-svg-path
+  artifacts:
+    paths:
+      - "*.json"
+
