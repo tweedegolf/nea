@@ -11,7 +11,9 @@ benchmark:
   tags: [docker]
   image: registry.gitlab.com/software-energy-lab/nea:latest
   script:
-    - cd nea/
+    - cd /nea
+    - pwd
+    - ls
     - runner go csv-svg-path
     - runner rust-nea csv-svg-path
     - runner roc-nea csv-svg-path
