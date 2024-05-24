@@ -17,7 +17,8 @@ benchmark:
     - runner go csv-svg-path
     - runner rust-nea csv-svg-path
     - runner roc-nea csv-svg-path
+    - cp /nea/*.json $CI_PROJECT_DIR
   artifacts:
     paths:
-      - "/nea/*.json"
+      - "*.json"
 
